@@ -85,8 +85,8 @@ enum class StateSelection : uint8_t {
 
 /**
  * Take the graph for percounter when it was requested and every task has a
- * shape percounter runs: one active subtask (AIC, or AIV0), any block count,
- * no sync start and no dispatch predicate.
+ * shape percounter runs: one active subtask (AIC, or AIV0) or a MIX task of
+ * two or three, any block count, no sync start and no dispatch predicate.
  *
  * `task_metadata` and `inline_completed_task_ids` are the default selection's
  * per-task walk, which has already rejected any malformed task and checked
@@ -108,6 +108,7 @@ inline StateSelection select_percounter_state(
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
     uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
+    uint64_t mix_order_count = 0;
     uint64_t block_total = 0;
     for (size_t t = 0; t < task_count; ++t) {
         const int64_t task_id = static_cast<int64_t>(t);
@@ -123,14 +124,17 @@ inline StateSelection select_percounter_state(
                 log_fallback(total_tasks, "a predicated task", task_id);
                 return StateSelection::DEFAULT;
             }
-            const TaskPlacement placement =
-                task_placement_from_active_mask(task_metadata[t].active_mask, &input.core_type_index);
-            if (placement != TaskPlacement::AIC && placement != TaskPlacement::AIV) {
-                log_fallback(total_tasks, "a MIX task", task_id);
+            const uint8_t active_mask = task_metadata[t].active_mask;
+            const TaskPlacement placement = task_placement_from_active_mask(active_mask, &input.core_type_index);
+            if (placement == TaskPlacement::UNSUPPORTED) {
+                log_fallback(total_tasks, active_mask == 4U ? "an AIV1-only task" : "a task with no subtask", task_id);
                 return StateSelection::DEFAULT;
             }
             input.block_num = slot.logical_block_num;
-            order_count[input.core_type_index] += static_cast<uint64_t>(input.block_num);
+            input.is_mix = placement == TaskPlacement::MIX;
+            input.subtask_count = __builtin_popcount(active_mask);
+            if (input.is_mix) mix_order_count += static_cast<uint64_t>(input.block_num);
+            else order_count[input.core_type_index] += static_cast<uint64_t>(input.block_num);
             block_total += static_cast<uint64_t>(input.block_num);
         } else {
             ++block_total;
@@ -145,7 +149,7 @@ inline StateSelection select_percounter_state(
         inputs[t].fanin_ids = inputs[t].fanin_count > 0 ? edges.data() + edge_begin[t] : nullptr;
 
     PercounterLayout layout{};
-    if (!plan_layout(task_count, block_total, edges.size(), order_count, &layout)) {
+    if (!plan_layout(task_count, block_total, edges.size(), order_count, &layout, mix_order_count)) {
         LOG_ERROR("A5 HBG percounter: state layout overflow");
         return StateSelection::FAILED;
     }
@@ -195,8 +199,9 @@ inline StateSelection select_percounter_state(
         device_state, host_base, static_cast<size_t>(layout.total_size), HostPhaseKind::Count, {}
     );
     LOG_INFO(
-        "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC and %" PRIu64 " AIV blocks, %zu edges)", total_tasks,
-        order_count[0], order_count[1], edges.size()
+        "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
+        " MIX blocks, %zu edges)",
+        total_tasks, order_count[0], order_count[1], mix_order_count, edges.size()
     );
     return StateSelection::PERCOUNTER;
 }
