@@ -145,14 +145,16 @@ inline __aicore__ bool percounter_fanin_ready(const LaneConfig &cfg, int64_t tas
 }
 
 /**
- * Run one task drawn from this lane's list. Its single active subtask is
- * whichever kernel slot is set; a task with none (a dependency-only task)
+ * Run one block drawn from this lane's list. The task's single active subtask
+ * is whichever kernel slot is set; a task with none (a dependency-only task)
  * runs nothing and is published like any other. `kernel_start` receives the
  * timestamp before the kernel call, or stays untouched when there is none.
  *
  * Returns false when the callable or the payload cannot be resolved.
  */
-inline __aicore__ bool percounter_run_task(const LaneConfig &cfg, int64_t task_id, uint64_t *kernel_start) {
+inline __aicore__ bool percounter_run_task(
+    const LaneConfig &cfg, int64_t task_id, int32_t block_idx, int32_t block_num, uint64_t *kernel_start
+) {
     // The whole data cache, before anything of this task is read. Kernels load
     // GM with plain scalar reads and never invalidate first, so a line this
     // core cached during an earlier task would survive another core rewriting
@@ -184,6 +186,11 @@ inline __aicore__ bool percounter_run_task(const LaneConfig &cfg, int64_t task_i
         SchedulerGraphResult::OK) {
         return false;
     }
+    // Written for every block, a single-block task included: the payload is
+    // this lane's for the whole run, so the previous block's values are still
+    // in it. Both fields share the control line with `function_bin_addr`.
+    cfg.payload->local_context.block_idx = block_idx;
+    cfg.payload->local_context.block_num = block_num;
     cfg.payload->global_context.sub_block_id = subtask_slot == 2 ? 1 : 0;
     scheduler_writeback_dispatch_payload(cfg.payload);
 
@@ -279,6 +286,11 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
     // decode a lane drew ahead into a 110-task fan-out and the wave ran on 24 of
     // 32 AIC lanes. So a lane whose last kernel was long draws one at a time.
     uint64_t batch = PERCOUNTER_CLAIM_BATCH;
+    // The task this range has already proved ready. An SPMD task puts several
+    // of its blocks in one range, and they share a fanin row, so without this
+    // the scan re-reads every producer once per block. Exact rather than a
+    // heuristic: completion is monotone, so a task proved ready stays ready.
+    int64_t proven_task = -1;
     static_assert(
         PERCOUNTER_CLAIM_BATCH <= 32, "the pending set is a uint32_t bitmask, one bit per position in the range"
     );
@@ -294,36 +306,44 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
             // every lane arriving after the last task leaves here.
             if (!percounter_claim_range(base, batch, cfg.order_count, &range_first, &range_end)) break;
             pending = static_cast<uint32_t>((uint64_t{1} << (range_end - range_first)) - 1);
+            proven_task = -1;
         }
 
         uint32_t slot = 0;
         bool found = false;
         int64_t task_id = -1;
+        uint64_t entry = 0;
         for (uint32_t probe = pending; probe != 0; probe &= probe - 1) {
             const uint32_t candidate = static_cast<uint32_t>(__builtin_ctz(probe));
-            const int64_t id = percounter_order_task_id(scheduler_gm_query(cfg.order[range_first + candidate]));
+            const uint64_t candidate_entry = scheduler_gm_query(cfg.order[range_first + candidate]);
+            const int64_t id = percounter_order_task_id(candidate_entry);
             if (id < 0 || static_cast<uint64_t>(id) >= cfg.task_count) {
                 percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
                 return;
             }
-            if (percounter_fanin_ready(cfg, id)) {
+            if (id == proven_task || percounter_fanin_ready(cfg, id)) {
                 slot = candidate;
                 task_id = id;
+                entry = candidate_entry;
                 found = true;
                 break;
             }
         }
         if (!found) {
             slot = static_cast<uint32_t>(__builtin_ctz(pending));
-            task_id = percounter_order_task_id(scheduler_gm_query(cfg.order[range_first + slot]));
+            entry = scheduler_gm_query(cfg.order[range_first + slot]);
+            task_id = percounter_order_task_id(entry);
         }
         pending &= ~(uint32_t{1} << slot);
         // Only the blocking path waits: the scan above already read a ready
         // task's producers to the end.
         if (!found && !percounter_wait_for_fanin(cfg, task_id, timeout_cycles)) break;
+        proven_task = task_id;
 
         uint64_t kernel_start = 0;
-        if (!percounter_run_task(cfg, task_id, &kernel_start)) {
+        if (!percounter_run_task(
+                cfg, task_id, percounter_order_block_idx(entry), percounter_order_block_num(entry), &kernel_start
+            )) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             break;
         }
