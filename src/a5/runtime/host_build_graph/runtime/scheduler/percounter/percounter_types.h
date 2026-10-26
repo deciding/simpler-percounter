@@ -143,7 +143,11 @@ inline constexpr uint32_t PERCOUNTER_TICKET_CAPACITY = 1;
 struct alignas(64) PercounterCounter {
     // 64-bit to match scheduler_gm_fetch_add, the runtime's only atomic add.
     uint64_t value;
-    uint8_t reserved[56];
+    // A Graph body task's invocation and its index in the body, written with the
+    // preset by the AICPU. Unused for a task-table task.
+    uint32_t invocation;
+    uint32_t body_index;
+    uint8_t reserved[48];
 };
 static_assert(sizeof(PercounterCounter) == 64, "a counter owns exactly one cache line");
 static_assert(alignof(PercounterCounter) == 64, "counters must not straddle lines");
@@ -299,23 +303,88 @@ inline __aicore__ uint32_t percounter_sync_desc_mask(uint64_t desc) {
 }
 
 /**
- * One Graph shell, for the AICPU that materializes its body.
- *
- * The AICPU could find the shells by walking the task table for TaskKind::GRAPH,
- * but not which counter each one publishes: that is a percounter id, and the
- * mapping from a table slot to one exists only on the host.
+ * The three lists a Graph body places entries in: one per core type, then MIX.
+ * Indexes the per-list arrays of the two records below.
  */
-struct PercounterShell {
-    // The percounter id of the shell itself, whose counter tells the body's
-    // roots that their storage exists.
-    uint64_t counter_id;
-    // The task-table slot the shell occupies. Materialization reads the boundary
-    // arguments and the Definition address from there and writes the body into
-    // the heap region the slot names.
-    uint64_t table_task_id;
+inline constexpr uint32_t PERCOUNTER_LIST_COUNT = PERCOUNTER_CORE_TYPE_COUNT + 1;
+inline constexpr uint32_t PERCOUNTER_LIST_MIX = PERCOUNTER_CORE_TYPE_COUNT;
+
+/** One body task of a Graph template. */
+struct PercounterBodyTask {
+    // Subtasks the task runs in all, `block_num * popcount(active_mask)`: what
+    // its counter is preset against.
+    uint32_t subtask_total;
+    uint32_t flags;  // PERCOUNTER_BODY_*
 };
-static_assert(sizeof(PercounterShell) == 16, "percounter shell record is a wire struct");
-static_assert(std::is_trivially_copyable_v<PercounterShell> && std::is_standard_layout_v<PercounterShell>);
+static_assert(sizeof(PercounterBodyTask) == 8, "percounter body task is a wire struct");
+static_assert(std::is_trivially_copyable_v<PercounterBodyTask> && std::is_standard_layout_v<PercounterBodyTask>);
+
+// No producer inside the body: it waits on the shell's own fanin instead.
+inline constexpr uint32_t PERCOUNTER_BODY_ROOT = 1U << 0;
+// No consumer inside the body: each of its subtasks also counts toward the shell.
+inline constexpr uint32_t PERCOUNTER_BODY_SINK = 1U << 1;
+inline constexpr uint32_t PERCOUNTER_BODY_PREDICATE = 1U << 2;
+
+/**
+ * What percounter keeps of one Graph Definition, built once per Definition per
+ * bind and shared by every invocation of it.
+ *
+ * The body's tasks are numbered 0..task_count-1 as in the Definition. The order
+ * entries carry those body indices as their task id; an invocation's entries are
+ * the same words with the invocation's first percounter id added.
+ *
+ * Every `*_offset` is from the region base.
+ */
+struct alignas(64) PercounterGraphTemplate {
+    uint64_t task_count;
+    uint64_t edge_count;
+    // Entries in each list, AIC, AIV and MIX, and where the template's own copy
+    // of each sits: the body's tasks by descending level inside the body.
+    uint64_t order_count[PERCOUNTER_LIST_COUNT];
+    uint64_t orders_offset[PERCOUNTER_LIST_COUNT];
+    uint64_t tasks_offset;  // PercounterBodyTask[task_count]
+    // The body's fanin rows: int32 offsets[task_count + 1], then int32 producer
+    // body indices[edge_count]. A producer always has the lower index.
+    uint64_t fanin_offsets_offset;
+    uint64_t fanin_indices_offset;
+    // Subtasks of the sink tasks, summed: the shell's counter preset.
+    uint64_t sink_subtask_total;
+    // Blocks lanes run, and MIX rendezvous they count, for one invocation.
+    uint64_t executable_blocks;
+    uint64_t mix_rendezvous_count;
+    uint64_t has_predicates;
+    // The longest chain of body tasks, in tasks.
+    uint64_t depth;
+};
+static_assert(sizeof(PercounterGraphTemplate) == 128, "percounter graph template is a wire struct");
+static_assert(
+    std::is_trivially_copyable_v<PercounterGraphTemplate> && std::is_standard_layout_v<PercounterGraphTemplate>
+);
+
+/**
+ * One Graph invocation: an outer task of kind GRAPH and the body it runs.
+ *
+ * The host writes everything but `storage_address`, which exists only once the
+ * AICPU has localized the invocation: the body's ChipTaskStorage array sits in
+ * the shell's heap, and the host never sees that heap's real address.
+ */
+struct alignas(64) PercounterGraphInvocation {
+    uint64_t template_offset;
+    // The shell's percounter id, which is also its task-table id. Its fanin is
+    // what the body's roots wait on, and its counter is what the sinks publish.
+    uint64_t shell_task_id;
+    // Percounter id of body task 0; body task i is `body_base + i`.
+    uint64_t body_base;
+    // First position of the invocation's range in each list. The range is the
+    // template's `order_count[l]` long and reads zero until the AICPU fills it.
+    uint64_t order_base[PERCOUNTER_LIST_COUNT];
+    uint64_t storage_address;
+    uint64_t reserved;
+};
+static_assert(sizeof(PercounterGraphInvocation) == 64, "a graph invocation owns exactly one cache line");
+static_assert(
+    std::is_trivially_copyable_v<PercounterGraphInvocation> && std::is_standard_layout_v<PercounterGraphInvocation>
+);
 
 /** Where a task's producers live in the flat fanin-address array. */
 struct PercounterFanin {
@@ -390,8 +459,8 @@ inline __aicore__ bool percounter_order_is_arming(uint64_t entry) {
  * each order list holds.
  */
 struct alignas(128) PercounterControl {
-    // Every task, including inline-completed ones; a lane bounds-checks the task
-    // id it unpacks from an entry against this.
+    // Every task, including inline-completed ones and Graph body tasks; a lane
+    // bounds-checks the task id it unpacks from an entry against this.
     uint64_t task_count;
     // Blocks a lane will actually run and fold into its progress. Under SPMD this
     // exceeds the task count, since a task with `block_num == N` runs N blocks;
@@ -422,13 +491,12 @@ struct alignas(128) PercounterControl {
     // descriptor a lane already reads, so a per-task test would put one more
     // device read on every task of every graph.
     uint64_t has_predicates;
-    // Offset of the per-task ChipTaskStorage address table, or 0 when every
-    // task's storage is in the shared-memory task table and a lane computes its
-    // address. Non-zero only for a graph with Graph bodies, whose storage lives
-    // in a shell's heap.
-    uint64_t storage_addresses_offset;
-    uint64_t shell_count;
-    uint64_t shells_offset;
+    // Tasks in the task table, which take percounter ids 0..table_task_count-1.
+    // Graph body tasks take the ids above, up to `task_count`; their storage is
+    // in their shell's heap, not in the table.
+    uint64_t table_task_count;
+    uint64_t graph_invocation_count;
+    uint64_t graph_invocations_offset;
     // The ring of queued cohort descriptors, one word per sync-start task, so a
     // sequence number never wraps and no enqueue finds it full.
     uint64_t sync_pending_offset;
@@ -450,9 +518,8 @@ struct alignas(128) PercounterControl {
     uint64_t lane_error;
     // Absolute device addresses resolved at bind, outside this region.
     uint64_t graph_storage_address;
-    // Entries in the task table `graph_storage_address` points at. Not this
-    // region's task count: Graph body tasks are numbered here and have no table
-    // slot.
+    // Entries in the task table `graph_storage_address` points at:
+    // `table_task_count`.
     uint64_t graph_storage_count;
     uint64_t callable_addresses_address;
     uint64_t callable_addresses_count;

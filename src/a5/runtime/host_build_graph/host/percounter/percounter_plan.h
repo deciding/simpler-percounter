@@ -60,12 +60,65 @@ struct PercounterLayout {
     uint64_t sync_cohort_count;
     uint64_t sync_cohort_offset;
     uint64_t sync_pending_offset;
-    // The Graph shell records and the per-task storage-address table, reserved
-    // only when the graph has a shell. A body task's storage lives in its
-    // shell's heap, where a lane cannot compute its address.
-    uint64_t shell_count;
-    uint64_t shells_offset;
-    uint64_t storage_addresses_offset;
+    // Tasks in the task table. `task_count` adds every Graph body task of every
+    // invocation, numbered after them.
+    uint64_t table_task_count;
+    // Graph templates, one blob, and one invocation record per GRAPH task;
+    // reserved only when the graph has one.
+    uint64_t graph_invocation_count;
+    uint64_t graph_invocations_offset;
+    uint64_t graph_templates_offset;
+    uint64_t graph_templates_bytes;
+    // The prefix of the region the host fills and uploads. The counters are the
+    // last segment, and a body task's counter is written by the AICPU before
+    // any lane can reach it, so the body counters are left out.
+    uint64_t upload_size;
+};
+
+/** The Graph part of the region, sized by the caller from its templates. */
+struct GraphLayoutInput {
+    uint64_t body_task_count{0};
+    uint64_t invocation_count{0};
+    uint64_t templates_bytes{0};
+};
+
+/** A template still in host memory, before it is copied into the region. */
+struct HostGraphTemplate {
+    std::vector<PercounterBodyTask> tasks;
+    std::vector<int32_t> fanin_offsets;  // task_count + 1
+    std::vector<int32_t> fanin_indices;
+    // Order entries by list, carrying body indices as task ids.
+    std::vector<uint64_t> orders[PERCOUNTER_LIST_COUNT];
+    uint64_t sink_subtask_total{0};
+    uint64_t executable_blocks{0};
+    uint64_t mix_rendezvous_count{0};
+    bool has_predicates{false};
+    uint64_t depth{0};
+};
+
+/** Bytes one template takes in the region, its header included. */
+inline uint64_t graph_template_bytes(const HostGraphTemplate &tmpl) {
+    uint64_t bytes = sizeof(PercounterGraphTemplate);
+    bytes += tmpl.tasks.size() * sizeof(PercounterBodyTask);
+    bytes += (tmpl.fanin_offsets.size() + tmpl.fanin_indices.size()) * sizeof(int32_t);
+    bytes = (bytes + alignof(uint64_t) - 1) & ~uint64_t{alignof(uint64_t) - 1};
+    for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l)
+        bytes += tmpl.orders[l].size() * sizeof(uint64_t);
+    return (bytes + alignof(PercounterGraphTemplate) - 1) & ~uint64_t{alignof(PercounterGraphTemplate) - 1};
+}
+
+/** One GRAPH task of the task table and the template its body follows. */
+struct GraphInvocationInput {
+    int64_t shell_task_id;
+    uint32_t template_index;
+};
+
+/** The Graph half of build_tables' input. */
+struct GraphPlanInput {
+    const HostGraphTemplate *templates{nullptr};
+    size_t template_count{0};
+    const GraphInvocationInput *invocations{nullptr};
+    size_t invocation_count{0};
 };
 
 /** What a lane needs that lives outside this region, resolved by the host. */
@@ -90,13 +143,19 @@ struct ExternalAddresses {
  * There are no per-cluster lists: the host does not know the cluster count at
  * bind time -- the AICPU discovers it after the handshake -- so one list per core
  * type, drawn by every lane of that type, is what needs no topology.
+ *
+ * `task_count` is the task table's. With Graph tasks, the list counts and
+ * `block_total` include every invocation's body, and `graph` sizes the rest.
  */
 inline bool plan_layout(
     uint64_t task_count, uint64_t block_total, uint64_t edge_count,
     const uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT], PercounterLayout *layout, uint64_t mix_order_count = 0,
-    uint64_t sync_cohort_count = 0, uint64_t shell_count = 0
+    uint64_t sync_cohort_count = 0, const GraphLayoutInput &graph = {}
 ) {
     if (layout == nullptr || order_count == nullptr) return false;
+    const uint64_t table_task_count = task_count;
+    if (graph.body_task_count > UINT32_MAX || table_task_count > UINT32_MAX - graph.body_task_count) return false;
+    task_count = table_task_count + graph.body_task_count;
     if (block_total < task_count) return false;
     if (mix_order_count > block_total) return false;
     if (sync_cohort_count > task_count) return false;
@@ -117,7 +176,9 @@ inline bool plan_layout(
         next.order_count[t] = order_count[t];
     next.mix_order_count = mix_order_count;
     next.sync_cohort_count = sync_cohort_count;
-    next.shell_count = shell_count;
+    next.table_task_count = table_task_count;
+    next.graph_invocation_count = graph.invocation_count;
+    next.graph_templates_bytes = graph.templates_bytes;
     next.entry_count = placed;
 
     uint64_t cursor = 0;
@@ -141,17 +202,21 @@ inline bool plan_layout(
           !PERCOUNTER_RESERVE(SCHEDULER_CLUSTER_CAPACITY, uint64_t, mix_signal_ready_offset))) ||
         (sync_cohort_count != 0 && (!PERCOUNTER_RESERVE(1, PercounterSyncQueue, sync_cohort_offset) ||
                                     !PERCOUNTER_RESERVE(2 * sync_cohort_count, uint64_t, sync_pending_offset))) ||
-        (shell_count != 0 && (!PERCOUNTER_RESERVE(shell_count, PercounterShell, shells_offset) ||
-                              !PERCOUNTER_RESERVE(task_count, uint64_t, storage_addresses_offset))) ||
-        !PERCOUNTER_RESERVE(task_count, PercounterFanin, fanin_offset) ||
+        (graph.invocation_count != 0 &&
+         (!PERCOUNTER_RESERVE(graph.invocation_count, PercounterGraphInvocation, graph_invocations_offset) ||
+          !scheduler_layout_reserve(
+              &cursor, graph.templates_bytes, alignof(PercounterGraphTemplate), &next.graph_templates_offset
+          ))) ||
+        !PERCOUNTER_RESERVE(table_task_count, PercounterFanin, fanin_offset) ||
         !PERCOUNTER_RESERVE(edge_count, uint64_t, fanin_addr_offset) ||
-        !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
         !PERCOUNTER_RESERVE(SCHEDULER_WORKER_CAPACITY, DispatchPayload, dispatch_payloads_offset) ||
+        !PERCOUNTER_RESERVE(task_count, PercounterCounter, counters_offset) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef PERCOUNTER_RESERVE
         return false;
     }
 #undef PERCOUNTER_RESERVE
+    next.upload_size = next.counters_offset + table_task_count * sizeof(PercounterCounter);
 
     *layout = next;
     return true;
@@ -220,10 +285,14 @@ struct TaskInput {
     bool has_predicate{false};
     // No lane claims this task and it is not finished either: it takes no entry,
     // its counter is preset like any other task's, and something outside the
-    // lanes publishes it. A Graph shell is the case -- the AICPU publishes it
-    // once the body it gates has been materialized. Mutually exclusive with
-    // `inline_completed`, which is already published at bind.
+    // lanes publishes it. Mutually exclusive with `inline_completed`, which is
+    // already published at bind.
     bool published_off_lane{false};
+    // A GRAPH task: the index of its invocation in GraphPlanInput, or -1. It
+    // runs nothing itself. It takes one range per list for its body instead of
+    // entries, and its counter is preset against its body's sink subtasks, which
+    // publish it.
+    int32_t graph_invocation{-1};
 };
 
 /** Why build_tables refused. Every one of these fails the bind. */
@@ -273,7 +342,9 @@ inline T *region_at(void *base, uint64_t offset) {
  * Fill the percounter region.
  *
  * `base` is the host staging mirror; `device_base` is where that image will
- * land, and is what the stored fanin addresses are computed against.
+ * land, and is what the stored fanin addresses are computed against. Only the
+ * first `layout.upload_size` bytes are written: the body counters past them are
+ * the AICPU's.
  *
  * Ascending task id is a topological order in hbg: a producer is always minted
  * before its consumer. The ordering below rests on that, so it is checked per
@@ -282,42 +353,45 @@ inline T *region_at(void *base, uint64_t offset) {
  */
 inline bool build_tables(
     const TaskInput *tasks, uint64_t task_count, const PercounterLayout &layout, void *base, uint64_t device_base,
-    const ExternalAddresses &external = {}, BuildResult *result = nullptr, const PercounterShell *shells = nullptr,
-    const uint64_t *storage_addresses = nullptr
+    const ExternalAddresses &external = {}, BuildResult *result = nullptr, const GraphPlanInput &graph = {}
 ) {
     const auto fail = [&](BuildStatus status, int64_t task_id, int32_t fanin_index) {
         if (result != nullptr) *result = BuildResult{status, task_id, fanin_index};
         return false;
     };
     if (result != nullptr) *result = BuildResult{};
-    if (base == nullptr || (tasks == nullptr && task_count != 0) || task_count != layout.task_count)
+    if (base == nullptr || (tasks == nullptr && task_count != 0) || task_count != layout.table_task_count ||
+        graph.invocation_count != layout.graph_invocation_count ||
+        (graph.invocation_count != 0 && (graph.invocations == nullptr || graph.templates == nullptr)))
         return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
 
-    std::memset(base, 0, static_cast<size_t>(layout.total_size));
+    std::memset(base, 0, static_cast<size_t>(layout.upload_size));
 
     auto *control = region_at<PercounterControl>(base, layout.control_offset);
     auto *fanin = region_at<PercounterFanin>(base, layout.fanin_offset);
     auto *fanin_addr = region_at<uint64_t>(base, layout.fanin_addr_offset);
     auto *counters = region_at<PercounterCounter>(base, layout.counters_offset);
-    uint64_t *orders[PERCOUNTER_CORE_TYPE_COUNT] = {
+    uint64_t *orders[PERCOUNTER_LIST_COUNT] = {
         region_at<uint64_t>(base, layout.orders_offset[0]),
         region_at<uint64_t>(base, layout.orders_offset[1]),
+        layout.mix_order_count != 0 ? region_at<uint64_t>(base, layout.mix_order_offset) : nullptr,
+    };
+    const uint64_t list_count[PERCOUNTER_LIST_COUNT] = {
+        layout.order_count[0], layout.order_count[1], layout.mix_order_count
     };
     // The tasks each list will hold, collected in id order and ordered by
-    // b-level once the whole graph has been walked.
-    std::vector<int64_t> eligible[PERCOUNTER_CORE_TYPE_COUNT];
-    for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t)
-        eligible[t].reserve(static_cast<size_t>(layout.order_count[t]));
-    std::vector<int64_t> eligible_mix;
-    eligible_mix.reserve(static_cast<size_t>(layout.mix_order_count));
+    // b-level once the whole graph has been walked. A GRAPH task stands for its
+    // whole body in every list the body uses.
+    std::vector<int64_t> eligible[PERCOUNTER_LIST_COUNT];
+    for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l)
+        eligible[l].reserve(static_cast<size_t>(list_count[l]));
     uint64_t edge_cursor = 0;
     // Entries, checked against the plan as the walk goes, so an overlong list
     // fails on the task that overran it.
-    uint64_t entries[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
-    uint64_t mix_entries = 0;
+    uint64_t entries[PERCOUNTER_LIST_COUNT] = {0, 0, 0};
     // Rendezvous the MIX done ticket will count. A sync-start MIX task's
     // rendezvous report to the sync queue, so it adds nothing here while adding
-    // one arming entry to `mix_entries`.
+    // one arming entry to the MIX list.
     uint64_t mix_rendezvous = 0;
     // Blocks a lane will run and fold. Differs from the entry count on exactly
     // the sync-start tasks, whose single entry runs nothing.
@@ -325,6 +399,28 @@ inline bool build_tables(
     uint64_t sync_cohorts = 0;
     uint64_t sync_blocks = 0;
     bool any_predicate = false;
+    // Body task ids follow the table's, invocation by invocation.
+    std::vector<uint64_t> body_base(graph.invocation_count, 0);
+    std::vector<bool> invocation_seen(graph.invocation_count, false);
+    uint64_t next_body_id = task_count;
+    for (size_t k = 0; k < graph.invocation_count; ++k) {
+        const GraphInvocationInput &invocation = graph.invocations[k];
+        if (invocation.template_index >= graph.template_count || invocation.shell_task_id < 0 ||
+            static_cast<uint64_t>(invocation.shell_task_id) >= task_count ||
+            tasks[invocation.shell_task_id].graph_invocation != static_cast<int32_t>(k))
+            return fail(BuildStatus::INVALID_ARGUMENT, invocation.shell_task_id, -1);
+        body_base[k] = next_body_id;
+        next_body_id += graph.templates[invocation.template_index].tasks.size();
+    }
+    if (next_body_id != layout.task_count) return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
+    const auto template_of = [&graph](const TaskInput &task) -> const HostGraphTemplate & {
+        return graph.templates[graph.invocations[task.graph_invocation].template_index];
+    };
+    const auto accept = [&](uint32_t list, uint64_t placed, uint64_t id) {
+        entries[list] += placed;
+        eligible[list].push_back(static_cast<int64_t>(id));
+        return entries[list] <= list_count[list];
+    };
 
     for (uint64_t id = 0; id < task_count; ++id) {
         const TaskInput &task = tasks[id];
@@ -352,11 +448,28 @@ inline bool build_tables(
         if (task.subtask_count < 1) return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
 
         if (task.has_predicate) any_predicate = true;
-        if (task.inline_completed && task.published_off_lane)
+        if (task.inline_completed && (task.published_off_lane || task.graph_invocation >= 0))
             return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
         if (task.inline_completed) {
             // Done before the run starts: in no list, and its consumers do not wait.
             counters[id].value = PERCOUNTER_COUNTER_PUBLISHED;
+            continue;
+        }
+        if (task.graph_invocation >= 0) {
+            if (static_cast<size_t>(task.graph_invocation) >= graph.invocation_count ||
+                invocation_seen[static_cast<size_t>(task.graph_invocation)] || task.sync_start)
+                return fail(BuildStatus::INVALID_ARGUMENT, static_cast<int64_t>(id), -1);
+            invocation_seen[static_cast<size_t>(task.graph_invocation)] = true;
+            const HostGraphTemplate &tmpl = template_of(task);
+            // Published by its body's sinks, one add per sink subtask.
+            counters[id].value = percounter_counter_preset(static_cast<int64_t>(tmpl.sink_subtask_total));
+            executable_blocks += tmpl.executable_blocks;
+            mix_rendezvous += tmpl.mix_rendezvous_count;
+            if (tmpl.has_predicates) any_predicate = true;
+            for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
+                if (!tmpl.orders[l].empty() && !accept(l, tmpl.orders[l].size(), id))
+                    return fail(BuildStatus::ORDER_COUNT_MISMATCH, static_cast<int64_t>(id), -1);
+            }
             continue;
         }
         if (task.published_off_lane) {
@@ -380,29 +493,26 @@ inline bool build_tables(
             ++sync_cohorts;
             sync_blocks += static_cast<uint64_t>(task.block_num);
         }
-        if (task.is_mix) {
-            mix_entries += placed;
-            if (!task.sync_start) mix_rendezvous += static_cast<uint64_t>(task.block_num);
-            if (mix_entries > layout.mix_order_count)
-                return fail(BuildStatus::ORDER_COUNT_MISMATCH, static_cast<int64_t>(id), -1);
-            eligible_mix.push_back(static_cast<int64_t>(id));
-            continue;
-        }
-        const uint32_t type = task.core_type_index;
-        entries[type] += placed;
-        if (entries[type] > layout.order_count[type])
+        if (task.is_mix && !task.sync_start) mix_rendezvous += static_cast<uint64_t>(task.block_num);
+        if (!accept(task.is_mix ? PERCOUNTER_LIST_MIX : task.core_type_index, placed, id))
             return fail(BuildStatus::ORDER_COUNT_MISMATCH, static_cast<int64_t>(id), -1);
-        eligible[type].push_back(static_cast<int64_t>(id));
     }
     if (sync_cohorts != layout.sync_cohort_count) return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
+    for (size_t k = 0; k < graph.invocation_count; ++k) {
+        if (!invocation_seen[k]) return fail(BuildStatus::INVALID_ARGUMENT, graph.invocations[k].shell_task_id, -1);
+    }
 
     // Longest path to a sink, per task. The walk above rejects any edge that
     // does not point backwards, so descending ids reach already-final values
     // and one pass suffices. Inline-completed tasks carry a level too: they are
     // in no list but still lengthen the paths that cross them.
+    //
+    // A GRAPH task weighs its body's depth rather than one: by the time its
+    // successors can start, its longest body chain has run.
     std::vector<int32_t> blevel(static_cast<size_t>(task_count), 0);
     for (uint64_t id = task_count; id-- > 0;) {
         const TaskInput &task = tasks[id];
+        if (task.graph_invocation >= 0) blevel[id] += static_cast<int32_t>(template_of(task).depth) - 1;
         for (int32_t e = 0; e < task.fanin_count; ++e) {
             const size_t producer = static_cast<size_t>(task.fanin_ids[e]);
             blevel[producer] = std::max(blevel[producer], blevel[id] + 1);
@@ -424,40 +534,97 @@ inline bool build_tables(
     // strictly earlier than its consumer under the global key, and tasks at
     // equal level have no edge between them. See percounter_claim_range.
     //
+    // A body sits in one range, keyed as its GRAPH task, with its own tasks by
+    // level inside it. The argument carries over: a root's producers precede
+    // the GRAPH task, the GRAPH task's level is at least one above its
+    // successors' however deep the body, and every edge inside the body points
+    // forward within the range.
+    //
     // Expansion into blocks happens after the sort, which keeps each task's
     // block indices ascending.
     const auto by_blevel = [&blevel](int64_t a, int64_t b) {
         return blevel[static_cast<size_t>(a)] > blevel[static_cast<size_t>(b)];
     };
-    const auto expand = [&](const std::vector<int64_t> &ids, uint64_t *list) {
+    std::vector<uint64_t> order_base(graph.invocation_count * PERCOUNTER_LIST_COUNT, 0);
+    for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
+        std::stable_sort(eligible[l].begin(), eligible[l].end(), by_blevel);
+        if (entries[l] != list_count[l]) return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
         uint64_t cursor = 0;
-        for (int64_t id : ids) {
+        for (int64_t id : eligible[l]) {
             const TaskInput &placed_task = tasks[static_cast<size_t>(id)];
+            if (placed_task.graph_invocation >= 0) {
+                // Left zero: an entry of block count zero is one the AICPU has
+                // not published yet.
+                order_base[static_cast<size_t>(placed_task.graph_invocation) * PERCOUNTER_LIST_COUNT + l] = cursor;
+                cursor += template_of(placed_task).orders[l].size();
+                continue;
+            }
             const int32_t blocks = placed_task.block_num;
             if (placed_task.sync_start) {
-                list[cursor++] = percounter_order_entry(id, PERCOUNTER_ORDER_BLOCK_IDX_ARM, blocks);
+                orders[l][cursor++] = percounter_order_entry(id, PERCOUNTER_ORDER_BLOCK_IDX_ARM, blocks);
                 continue;
             }
             for (int32_t b = 0; b < blocks; ++b)
-                list[cursor++] = percounter_order_entry(id, b, blocks);
+                orders[l][cursor++] = percounter_order_entry(id, b, blocks);
         }
-        return cursor;
-    };
-    for (uint32_t t = 0; t < PERCOUNTER_CORE_TYPE_COUNT; ++t) {
-        std::stable_sort(eligible[t].begin(), eligible[t].end(), by_blevel);
-        if (entries[t] != layout.order_count[t]) return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
-        if (expand(eligible[t], orders[t]) != layout.order_count[t])
-            return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
+        if (cursor != list_count[l]) return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
     }
-    // The MIX list takes the same key and the same expansion.
-    std::stable_sort(eligible_mix.begin(), eligible_mix.end(), by_blevel);
-    if (mix_entries != layout.mix_order_count) return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
-    if (layout.mix_order_count != 0 &&
-        expand(eligible_mix, region_at<uint64_t>(base, layout.mix_order_offset)) != layout.mix_order_count)
-        return fail(BuildStatus::ORDER_COUNT_MISMATCH, -1, -1);
     if (edge_cursor != layout.edge_count) return fail(BuildStatus::EDGE_COUNT_MISMATCH, -1, -1);
 
-    control->task_count = task_count;
+    // Templates, back to back, then one record per invocation pointing at its own.
+    std::vector<uint64_t> template_offset(graph.template_count, 0);
+    uint64_t template_cursor = 0;
+    for (size_t t = 0; t < graph.template_count; ++t) {
+        const HostGraphTemplate &tmpl = graph.templates[t];
+        const uint64_t bytes = graph_template_bytes(tmpl);
+        if (template_cursor + bytes > layout.graph_templates_bytes) return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
+        const uint64_t at = layout.graph_templates_offset + template_cursor;
+        template_offset[t] = at;
+        auto *header = region_at<PercounterGraphTemplate>(base, at);
+        *header = PercounterGraphTemplate{};
+        header->task_count = tmpl.tasks.size();
+        header->edge_count = tmpl.fanin_indices.size();
+        header->sink_subtask_total = tmpl.sink_subtask_total;
+        header->executable_blocks = tmpl.executable_blocks;
+        header->mix_rendezvous_count = tmpl.mix_rendezvous_count;
+        header->has_predicates = tmpl.has_predicates ? 1 : 0;
+        header->depth = tmpl.depth;
+        uint64_t field = at + sizeof(PercounterGraphTemplate);
+        const auto place = [&](const void *src, uint64_t len, uint64_t align) {
+            field = (field + align - 1) & ~(align - 1);
+            const uint64_t where = field;
+            if (len != 0) std::memcpy(region_at<uint8_t>(base, where), src, static_cast<size_t>(len));
+            field += len;
+            return where;
+        };
+        header->tasks_offset =
+            place(tmpl.tasks.data(), tmpl.tasks.size() * sizeof(PercounterBodyTask), alignof(PercounterBodyTask));
+        header->fanin_offsets_offset =
+            place(tmpl.fanin_offsets.data(), tmpl.fanin_offsets.size() * sizeof(int32_t), alignof(int32_t));
+        header->fanin_indices_offset =
+            place(tmpl.fanin_indices.data(), tmpl.fanin_indices.size() * sizeof(int32_t), alignof(int32_t));
+        for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
+            header->order_count[l] = tmpl.orders[l].size();
+            header->orders_offset[l] =
+                place(tmpl.orders[l].data(), tmpl.orders[l].size() * sizeof(uint64_t), alignof(uint64_t));
+        }
+        template_cursor += bytes;
+    }
+    auto *invocations = layout.graph_invocation_count != 0 ?
+                            region_at<PercounterGraphInvocation>(base, layout.graph_invocations_offset) :
+                            nullptr;
+    for (size_t k = 0; k < graph.invocation_count; ++k) {
+        PercounterGraphInvocation &record = invocations[k];
+        record = PercounterGraphInvocation{};
+        record.template_offset = template_offset[graph.invocations[k].template_index];
+        record.shell_task_id = static_cast<uint64_t>(graph.invocations[k].shell_task_id);
+        record.body_base = body_base[k];
+        for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l)
+            record.order_base[l] = order_base[k * PERCOUNTER_LIST_COUNT + l];
+    }
+
+    control->task_count = layout.task_count;
+    control->table_task_count = task_count;
     control->executable_task_count = executable_blocks;
     control->edge_count = layout.edge_count;
     control->tickets_offset = layout.tickets_offset;
@@ -466,20 +633,8 @@ inline bool build_tables(
     control->sync_cohort_count = layout.sync_cohort_count;
     control->sync_cohort_offset = layout.sync_cohort_offset;
     control->sync_pending_offset = layout.sync_pending_offset;
-    control->shell_count = layout.shell_count;
-    control->shells_offset = layout.shells_offset;
-    control->storage_addresses_offset = layout.storage_addresses_offset;
-    if (layout.shell_count != 0) {
-        if (shells == nullptr || storage_addresses == nullptr) return fail(BuildStatus::INVALID_ARGUMENT, -1, -1);
-        std::memcpy(
-            region_at<PercounterShell>(base, layout.shells_offset), shells,
-            static_cast<size_t>(layout.shell_count) * sizeof(PercounterShell)
-        );
-        std::memcpy(
-            region_at<uint64_t>(base, layout.storage_addresses_offset), storage_addresses,
-            static_cast<size_t>(task_count) * sizeof(uint64_t)
-        );
-    }
+    control->graph_invocation_count = layout.graph_invocation_count;
+    control->graph_invocations_offset = layout.graph_invocations_offset;
     control->sync_block_total = sync_blocks;
     control->has_predicates = any_predicate ? 1 : 0;
     control->mix_order_offset = layout.mix_order_offset;

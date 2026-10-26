@@ -20,6 +20,9 @@ a5_hbg_case(test_hbg_scheduler_contracts.cpp
 a5_hbg_case(test_hbg_percounter_selection.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 
+a5_hbg_case(test_hbg_percounter_graph.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
 a5_hbg_case(test_hbg_percounter_tables.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 

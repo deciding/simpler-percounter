@@ -1134,16 +1134,17 @@ bool create_scheduler_state(
         );
         return false;
     }
-    if (!simpler::hbg::percounter::check_scheduler_request(host_sm_handle, total_tasks)) return false;
+    if (!simpler::hbg::percounter::check_scheduler_request()) return false;
     SchedulerGraphView host_graph{
         reinterpret_cast<uint64_t>(host_sm_handle.header->tasks.task_storage),
         0,
         static_cast<uint64_t>(total_tasks),
         task_window_size - 1,
     };
+    const bool percounter_graph_tasks = simpler::hbg::percounter::percounter_takes_graph_tasks();
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
-        if (slot.task_kind == TaskKind::GRAPH) {
+        if (slot.task_kind == TaskKind::GRAPH && !percounter_graph_tasks) {
             select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
             LOG_INFO("A5 HBG: retaining AICPU scheduling for a graph-execution run");
             return true;
@@ -1161,6 +1162,7 @@ bool create_scheduler_state(
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_id = -1;
+    uint64_t graph_task_count = 0;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
     // has not run yet, and orch::prepare_task resets every claimed slot this
@@ -1168,6 +1170,11 @@ bool create_scheduler_state(
     // future host-side publication would silently change what these tests mean.
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
+        // Reached only when percounter takes GRAPH tasks; it validates them.
+        if (slot.task_kind == TaskKind::GRAPH) {
+            ++graph_task_count;
+            continue;
+        }
         SchedulerTaskShape shape{};
         SchedulerGraphResult status = scheduler_classify_task_shape(host_graph, task_id, &shape);
         bool inline_dispatch_task = false;
@@ -1291,7 +1298,8 @@ bool create_scheduler_state(
         ++executable_task_count;
     }
 
-    if (executable_task_count + inline_completed_task_ids.size() != static_cast<uint64_t>(total_tasks)) {
+    if (executable_task_count + inline_completed_task_ids.size() + graph_task_count !=
+        static_cast<uint64_t>(total_tasks)) {
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
@@ -1300,6 +1308,11 @@ bool create_scheduler_state(
     );
     if (percounter != simpler::hbg::percounter::StateSelection::DEFAULT)
         return percounter == simpler::hbg::percounter::StateSelection::PERCOUNTER;
+    if (graph_task_count != 0) {
+        select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
+        LOG_INFO("A5 HBG: retaining AICPU scheduling for a graph-execution run");
+        return true;
+    }
     if (legacy_shape_task_id >= 0) {
         select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(

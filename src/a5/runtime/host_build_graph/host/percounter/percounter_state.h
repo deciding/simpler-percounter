@@ -15,11 +15,12 @@
  * Two entry points, both called from create_scheduler_state:
  *
  *  - check_scheduler_request, before anything else: rejects an unrecognised
- *    SIMPLER_HBG_SCHEDULER_TYPE, and logs the fallback for a graph-execution
- *    run, which the default selection hands to legacy before the per-task walk.
+ *    SIMPLER_HBG_SCHEDULER_TYPE.
  *  - select_percounter_state, after the default selection's per-task walk:
  *    reuses that walk's validation and metadata, and either builds the
- *    percounter region or logs why the graph falls back.
+ *    percounter region or logs why the graph falls back. When percounter is
+ *    requested the walk passes over GRAPH tasks, which are validated here
+ *    through their Definitions.
  *
  * Header-only because the UT targets that compile runtime_maker.cpp list their
  * sources by name.
@@ -31,6 +32,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <utility>
 #include <vector>
 
 #include "common/host_api.h"
@@ -39,6 +42,7 @@
 #include "host_build_graph/runtime.h"
 #include "host_build_graph/shared_memory.h"
 #include "intrinsic.h"
+#include "percounter_graph.h"
 #include "percounter_plan.h"
 #include "percounter_selection.h"
 #include "scheduler/scheduler_layout.h"
@@ -64,17 +68,72 @@ inline void log_fallback(int32_t total_tasks, const char *reason, int64_t task_i
  * Settle this bind's scheduler request before the default selection runs.
  * Returns false, failing the bind, only for an unrecognised value.
  */
-inline bool check_scheduler_request(SharedMemoryHandle &host_sm_handle, int32_t total_tasks) {
+inline bool check_scheduler_request() {
     SchedulerRequest request = SchedulerRequest::DEFAULT;
-    if (!resolve_scheduler_request(&request)) return false;
-    if (request != SchedulerRequest::PERCOUNTER) return true;
+    return resolve_scheduler_request(&request);
+}
+
+/** Whether the default selection's walk leaves GRAPH tasks to percounter. */
+inline bool percounter_takes_graph_tasks() { return percounter_requested(); }
+
+/** The bind's Graph templates and invocations, gathered from the task table. */
+struct GraphInputs {
+    std::vector<HostGraphTemplate> templates;
+    std::vector<GraphInvocationInput> invocations;
+    GraphLayoutInput layout{};
+    uint64_t body_blocks{0};
+};
+
+/**
+ * Build one template per Definition the GRAPH tasks name, reading the bind's
+ * Definition staging block, and one invocation per GRAPH task.
+ *
+ * Returns the status of the first template that failed, which is MALFORMED for
+ * a Definition upstream would refuse and UNSUPPORTED for a body percounter does
+ * not run. `failed_task_id` is then the GRAPH task that named it.
+ */
+inline TemplateResult gather_graph_inputs(
+    const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks, std::vector<TaskInput> *inputs,
+    GraphInputs *out, int64_t *failed_task_id
+) {
+    // Read on the first GRAPH task: a graph without one has no staging block.
+    GraphImageView view{};
+    std::map<uint32_t, uint32_t> template_of_definition;
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
-        if (host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id).task_kind == TaskKind::GRAPH) {
-            log_fallback(total_tasks, "a graph-execution task", task_id);
-            break;
+        ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
+        if (slot.task_kind != TaskKind::GRAPH) continue;
+        if (!view.valid()) {
+            void *staging = nullptr;
+            size_t staging_bytes = 0;
+            api->get_graph_definition_staging(&staging, &staging_bytes);
+            if (staging == nullptr || staging_bytes > UINT32_MAX) {
+                *failed_task_id = task_id;
+                return TemplateResult{TemplateStatus::MALFORMED, "the Definition staging block is unavailable", -1};
+            }
+            view = GraphImageView{static_cast<const std::byte *>(staging), static_cast<uint32_t>(staging_bytes)};
         }
+        const uint32_t definition_offset = slot.to_descriptor().graph_definition_offset;
+        auto found = template_of_definition.find(definition_offset);
+        if (found == template_of_definition.end()) {
+            HostGraphTemplate tmpl{};
+            const TemplateResult built = read_graph_template(view, definition_offset, &tmpl);
+            if (built.status != TemplateStatus::OK) {
+                *failed_task_id = task_id;
+                return built;
+            }
+            out->layout.templates_bytes += graph_template_bytes(tmpl);
+            out->templates.push_back(std::move(tmpl));
+            found = template_of_definition.emplace(definition_offset, out->templates.size() - 1).first;
+        }
+        const HostGraphTemplate &tmpl = out->templates[found->second];
+        TaskInput &input = (*inputs)[static_cast<size_t>(task_id)];
+        input.graph_invocation = static_cast<int32_t>(out->invocations.size());
+        out->invocations.push_back(GraphInvocationInput{task_id, found->second});
+        out->layout.body_task_count += tmpl.tasks.size();
+        out->body_blocks += tmpl.executable_blocks;
     }
-    return true;
+    out->layout.invocation_count = out->invocations.size();
+    return TemplateResult{};
 }
 
 enum class StateSelection : uint8_t {
@@ -106,18 +165,52 @@ inline StateSelection select_percounter_state(
         inline_completed[static_cast<size_t>(id)] = true;
 
     std::vector<TaskInput> inputs(task_count);
+    GraphInputs graph{};
+    int64_t graph_failed_task = -1;
+    const TemplateResult graph_status =
+        gather_graph_inputs(api, host_sm_handle, total_tasks, &inputs, &graph, &graph_failed_task);
+    if (graph_status.status == TemplateStatus::MALFORMED) {
+        LOG_ERROR(
+            "A5 HBG percounter: Graph task id=%" PRId64 ": %s (body task %d)", graph_failed_task, graph_status.reason,
+            graph_status.body_index
+        );
+        return StateSelection::FAILED;
+    }
+    if (graph_status.status == TemplateStatus::UNSUPPORTED) {
+        log_fallback(total_tasks, graph_status.reason, graph_failed_task);
+        return StateSelection::DEFAULT;
+    }
+    if (!graph.invocations.empty()) {
+        LOG_INFO(
+            "A5 HBG: %s=percounter for %d tasks: %zu Graph invocations of %zu Definitions (%" PRIu64
+            " body tasks) are not run by percounter lanes; keeping the default scheduler selection",
+            SCHEDULER_TYPE_ENV, total_tasks, graph.invocations.size(), graph.templates.size(),
+            graph.layout.body_task_count
+        );
+        return StateSelection::DEFAULT;
+    }
+
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
     uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
     uint64_t mix_order_count = 0;
     uint64_t sync_cohort_count = 0;
-    uint64_t block_total = 0;
+    // Each GRAPH task places its body's blocks, and holds one of its own that
+    // no list carries.
+    uint64_t block_total = graph.body_blocks;
     for (size_t t = 0; t < task_count; ++t) {
         const int64_t task_id = static_cast<int64_t>(t);
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
         TaskInput &input = inputs[t];
         input.inline_completed = inline_completed[t];
-        if (!input.inline_completed) {
+        if (input.graph_invocation >= 0) {
+            const HostGraphTemplate &tmpl =
+                graph.templates[graph.invocations[static_cast<size_t>(input.graph_invocation)].template_index];
+            order_count[0] += tmpl.orders[0].size();
+            order_count[1] += tmpl.orders[1].size();
+            mix_order_count += tmpl.orders[PERCOUNTER_LIST_MIX].size();
+            ++block_total;
+        } else if (!input.inline_completed) {
             input.sync_start = slot.task_attrs.requires_sync_start();
             input.has_predicate = slot.task_attrs.has_predicate();
             const uint8_t active_mask = task_metadata[t].active_mask;
@@ -149,7 +242,10 @@ inline StateSelection select_percounter_state(
         inputs[t].fanin_ids = inputs[t].fanin_count > 0 ? edges.data() + edge_begin[t] : nullptr;
 
     PercounterLayout layout{};
-    if (!plan_layout(task_count, block_total, edges.size(), order_count, &layout, mix_order_count, sync_cohort_count)) {
+    if (!plan_layout(
+            task_count, block_total, edges.size(), order_count, &layout, mix_order_count, sync_cohort_count,
+            graph.layout
+        )) {
         LOG_ERROR("A5 HBG percounter: state layout overflow");
         return StateSelection::FAILED;
     }
@@ -171,7 +267,10 @@ inline StateSelection select_percounter_state(
     external.callable_table = runtime->callable_entry_table_addr();
     external.callable_count = static_cast<uint64_t>(runtime->callable_table_len());
     BuildResult build{};
-    if (!build_tables(inputs.data(), task_count, layout, host_base, device_base, external, &build)) {
+    const GraphPlanInput graph_plan{
+        graph.templates.data(), graph.templates.size(), graph.invocations.data(), graph.invocations.size()
+    };
+    if (!build_tables(inputs.data(), task_count, layout, host_base, device_base, external, &build, graph_plan)) {
         LOG_ERROR(
             "A5 HBG percounter: %s (task id=%" PRId64 ", fanin index=%d)", build_status_name(build.status),
             build.task_id, build.fanin_index
@@ -196,7 +295,7 @@ inline StateSelection select_percounter_state(
 
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
     runtime->add_pending_metadata(
-        device_state, host_base, static_cast<size_t>(layout.total_size), HostPhaseKind::Count, {}
+        device_state, host_base, static_cast<size_t>(layout.upload_size), HostPhaseKind::Count, {}
     );
     LOG_INFO(
         "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
