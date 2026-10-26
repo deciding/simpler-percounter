@@ -101,8 +101,9 @@ struct HostGraphTemplate {
 inline uint64_t graph_template_bytes(const HostGraphTemplate &tmpl) {
     uint64_t bytes = sizeof(PercounterGraphTemplate);
     bytes += tmpl.tasks.size() * sizeof(PercounterBodyTask);
-    bytes += (tmpl.fanin_offsets.size() + tmpl.fanin_indices.size()) * sizeof(int32_t);
+    bytes += tmpl.fanin_offsets.size() * sizeof(int32_t);
     bytes = (bytes + alignof(uint64_t) - 1) & ~uint64_t{alignof(uint64_t) - 1};
+    bytes += tmpl.fanin_indices.size() * sizeof(uint64_t);
     for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l)
         bytes += tmpl.orders[l].size() * sizeof(uint64_t);
     return (bytes + alignof(PercounterGraphTemplate) - 1) & ~uint64_t{alignof(PercounterGraphTemplate) - 1};
@@ -603,8 +604,8 @@ inline bool build_tables(
             place(tmpl.tasks.data(), tmpl.tasks.size() * sizeof(PercounterBodyTask), alignof(PercounterBodyTask));
         header->fanin_offsets_offset =
             place(tmpl.fanin_offsets.data(), tmpl.fanin_offsets.size() * sizeof(int32_t), alignof(int32_t));
-        header->fanin_indices_offset =
-            place(tmpl.fanin_indices.data(), tmpl.fanin_indices.size() * sizeof(int32_t), alignof(int32_t));
+        const std::vector<uint64_t> producers(tmpl.fanin_indices.begin(), tmpl.fanin_indices.end());
+        header->fanin_indices_offset = place(producers.data(), producers.size() * sizeof(uint64_t), alignof(uint64_t));
         for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
             header->order_count[l] = tmpl.orders[l].size();
             header->orders_offset[l] =

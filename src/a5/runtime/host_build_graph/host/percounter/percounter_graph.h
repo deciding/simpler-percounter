@@ -102,17 +102,21 @@ inline TemplateResult build_graph_template(
     std::vector<int64_t> eligible[PERCOUNTER_LIST_COUNT];
     for (int32_t i = 0; i < task_count; ++i) {
         const BodyTaskShape &shape = shapes[i];
-        uint8_t core_type = 0;
-        const TaskPlacement placement = task_placement_from_active_mask(shape.active_mask, &core_type);
+        // A dependency-only task runs no kernel but still orders its consumers
+        // after its producers. It takes one entry in the AIV list, the list
+        // every vector lane draws, and counts as one subtask: the lane that
+        // reaches it publishes it once its producers have.
+        const bool dummy = shape.active_mask == 0;
+        uint8_t core_type = 1;
+        const TaskPlacement placement =
+            dummy ? TaskPlacement::AIV : task_placement_from_active_mask(shape.active_mask, &core_type);
         if (placement == TaskPlacement::UNSUPPORTED)
-            return fail(
-                TemplateStatus::UNSUPPORTED,
-                shape.active_mask == 4U ? "an AIV1-only body task" : "a body task with no subtask", i
-            );
+            return fail(TemplateStatus::UNSUPPORTED, "an AIV1-only body task", i);
         if (shape.sync_start) return fail(TemplateStatus::UNSUPPORTED, "a sync-start body task", i);
-        const int32_t subtasks = __builtin_popcount(shape.active_mask);
-        if (shape.block_num < 1 || shape.block_num > UINT16_MAX / subtasks ||
-            shape.total_required_subtasks != shape.block_num * subtasks)
+        const int32_t subtasks = dummy ? 1 : __builtin_popcount(shape.active_mask);
+        if (dummy ? (shape.block_num != 1 || shape.total_required_subtasks != 0 || shape.has_predicate) :
+                    (shape.block_num < 1 || shape.block_num > UINT16_MAX / subtasks ||
+                     shape.total_required_subtasks != shape.block_num * subtasks))
             return fail(TemplateStatus::MALFORMED, "inconsistent block and subtask counts", i);
         // The same scope the task table has: a predicate on one block of one
         // subtask, which is all the lane evaluates.
@@ -120,7 +124,7 @@ inline TemplateResult build_graph_template(
             return fail(TemplateStatus::UNSUPPORTED, "a predicate on a multi-block or MIX body task", i);
 
         PercounterBodyTask &task = next.tasks[static_cast<size_t>(i)];
-        task.subtask_total = static_cast<uint32_t>(shape.total_required_subtasks);
+        task.subtask_total = static_cast<uint32_t>(shape.block_num * subtasks);
         task.flags = 0;
         if (fanin_offsets[i] == fanin_offsets[i + 1]) task.flags |= PERCOUNTER_BODY_ROOT;
         if (!has_consumer[static_cast<size_t>(i)]) {

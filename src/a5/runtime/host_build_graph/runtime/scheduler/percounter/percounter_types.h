@@ -143,11 +143,19 @@ inline constexpr uint32_t PERCOUNTER_TICKET_CAPACITY = 1;
 struct alignas(64) PercounterCounter {
     // 64-bit to match scheduler_gm_fetch_add, the runtime's only atomic add.
     uint64_t value;
-    // A Graph body task's invocation and its index in the body, written with the
-    // preset by the AICPU. Unused for a task-table task.
+    // The rest describes a Graph body task, written with the preset by the
+    // AICPU before the task's entry is published, and never changed after: the
+    // one line a lane reads to run the task. Unused for a task-table task.
+    uint64_t storage_address;  // the invocation's ChipTaskStorage array
+    uint32_t body_index;       // this task's index in it, and in its body
+    uint32_t flags;            // PERCOUNTER_BODY_*
+    uint32_t shell_task_id;
+    uint32_t fanin_count;
+    // Region offset of this task's producers, as uint64 body indices. Unused for
+    // a root, which waits on its shell's fanin instead.
+    uint64_t fanin_offset;
     uint32_t invocation;
-    uint32_t body_index;
-    uint8_t reserved[48];
+    uint8_t reserved[20];
 };
 static_assert(sizeof(PercounterCounter) == 64, "a counter owns exactly one cache line");
 static_assert(alignof(PercounterCounter) == 64, "counters must not straddle lines");
@@ -343,8 +351,9 @@ struct alignas(64) PercounterGraphTemplate {
     uint64_t order_count[PERCOUNTER_LIST_COUNT];
     uint64_t orders_offset[PERCOUNTER_LIST_COUNT];
     uint64_t tasks_offset;  // PercounterBodyTask[task_count]
-    // The body's fanin rows: int32 offsets[task_count + 1], then int32 producer
-    // body indices[edge_count]. A producer always has the lower index.
+    // The body's fanin rows: int32 offsets[task_count + 1], then uint64 producer
+    // body indices[edge_count], which a lane reads with a 64-bit device load. A
+    // producer always has the lower index.
     uint64_t fanin_offsets_offset;
     uint64_t fanin_indices_offset;
     // Subtasks of the sink tasks, summed: the shell's counter preset.

@@ -210,6 +210,18 @@ TEST(PercounterGraphPrepare, PublishesTheStorageAddressCountersAndEntries) {
         EXPECT_EQ(counter.value, pc::percounter_counter_preset(1)) << "body task " << i;
         EXPECT_EQ(counter.invocation, 0u);
         EXPECT_EQ(counter.body_index, i);
+        EXPECT_EQ(counter.storage_address, run.invocation()->storage_address);
+        EXPECT_EQ(counter.shell_task_id, 0u);
+    }
+    // What a lane reads instead of the template: the root waits on its shell,
+    // the others on one body producer each, and the last publishes the shell.
+    EXPECT_EQ(run.counters()[1].flags, pc::PERCOUNTER_BODY_ROOT);
+    EXPECT_EQ(run.counters()[2].flags, 0u);
+    EXPECT_EQ(run.counters()[3].flags, pc::PERCOUNTER_BODY_SINK);
+    for (uint32_t i = 1; i < 3; ++i) {
+        const pc::PercounterCounter &counter = run.counters()[1 + i];
+        ASSERT_EQ(counter.fanin_count, 1u);
+        EXPECT_EQ(*pc::percounter_region<uint64_t>(run.control(), counter.fanin_offset), i - 1) << "body task " << i;
     }
     // The ranges now hold real entries, the template's carried to percounter ids.
     const uint64_t *aic = run.list(0) + run.invocation()->order_base[0];

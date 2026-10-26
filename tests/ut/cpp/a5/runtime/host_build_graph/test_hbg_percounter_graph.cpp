@@ -149,16 +149,29 @@ TEST(PercounterGraphTemplate, RefusesBodyShapesPercounterDoesNotRunAsUnsupported
     }
     {
         Body body;
-        body.add(pc::BodyTaskShape{0, false, false, 1, 0});
-        EXPECT_EQ(body.build(&tmpl).status, pc::TemplateStatus::UNSUPPORTED);
-    }
-    {
-        Body body;
         pc::BodyTaskShape predicated = shape(kAiv, 2);
         predicated.has_predicate = true;
         body.add(predicated);
         EXPECT_EQ(body.build(&tmpl).status, pc::TemplateStatus::UNSUPPORTED);
     }
+}
+
+// A dependency-only task runs nothing but still orders its consumers after its
+// producers, so it is one AIV entry worth one subtask rather than nothing.
+TEST(PercounterGraphTemplate, PlacesADependencyOnlyTaskAsOneAivSubtask) {
+    Body body;
+    body.add(shape(kAic));
+    body.add(pc::BodyTaskShape{0, false, false, 1, 0}, {0});
+    body.add(shape(kAic), {1});
+    pc::HostGraphTemplate tmpl;
+    ASSERT_EQ(body.build(&tmpl).status, pc::TemplateStatus::OK);
+    EXPECT_EQ(tmpl.tasks[1].subtask_total, 1u);
+    EXPECT_EQ(ids_of(tmpl.orders[1]), (std::vector<int64_t>{1}));
+    EXPECT_EQ(tmpl.executable_blocks, 3u);
+
+    Body predicated;
+    predicated.add(pc::BodyTaskShape{0, false, true, 1, 0});
+    EXPECT_EQ(predicated.build(&tmpl).status, pc::TemplateStatus::MALFORMED);
 }
 
 TEST(PercounterGraphTemplate, AcceptsAPredicateOnASingleBlockTask) {

@@ -77,6 +77,10 @@ inline void percounter_graph_prepare_init(PercounterControl *control) {
             percounter_region<uint8_t>(control, tmpl->tasks_offset),
             static_cast<size_t>(tmpl->task_count) * sizeof(PercounterBodyTask)
         );
+        cache_invalidate_range(
+            percounter_region<uint8_t>(control, tmpl->fanin_offsets_offset),
+            static_cast<size_t>(tmpl->task_count + 1) * sizeof(int32_t)
+        );
         for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
             cache_invalidate_range(
                 percounter_region<uint8_t>(control, tmpl->orders_offset[l]),
@@ -128,6 +132,7 @@ inline bool percounter_prepare_invocation(
     auto *invocation = percounter_region<PercounterGraphInvocation>(control, control->graph_invocations_offset) + rank;
     const auto *tmpl = percounter_region<const PercounterGraphTemplate>(control, invocation->template_offset);
     const auto *body = percounter_region<const PercounterBodyTask>(control, tmpl->tasks_offset);
+    const auto *fanin_rows = percounter_region<const int32_t>(control, tmpl->fanin_offsets_offset);
     auto *counters = percounter_region<PercounterCounter>(control, control->counters_offset);
     uint64_t *lists[PERCOUNTER_LIST_COUNT] = {
         percounter_region<uint64_t>(control, control->orders_offset[0]),
@@ -166,8 +171,13 @@ inline bool percounter_prepare_invocation(
             percounter_flush_body_task(execution->task_at(i));
             PercounterCounter &counter = counters[body_base + static_cast<uint64_t>(i)];
             counter.value = percounter_counter_preset(static_cast<int64_t>(body[i].subtask_total));
-            counter.invocation = static_cast<uint32_t>(rank);
+            counter.storage_address = invocation->storage_address;
             counter.body_index = static_cast<uint32_t>(i);
+            counter.flags = body[i].flags;
+            counter.shell_task_id = static_cast<uint32_t>(invocation->shell_task_id);
+            counter.fanin_count = static_cast<uint32_t>(fanin_rows[i + 1] - fanin_rows[i]);
+            counter.fanin_offset = tmpl->fanin_indices_offset + static_cast<uint64_t>(fanin_rows[i]) * sizeof(uint64_t);
+            counter.invocation = static_cast<uint32_t>(rank);
             cache_flush_range(&counter, sizeof(counter));
         }
         materialized = end;

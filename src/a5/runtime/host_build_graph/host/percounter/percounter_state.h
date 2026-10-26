@@ -180,16 +180,6 @@ inline StateSelection select_percounter_state(
         log_fallback(total_tasks, graph_status.reason, graph_failed_task);
         return StateSelection::DEFAULT;
     }
-    if (!graph.invocations.empty()) {
-        LOG_INFO(
-            "A5 HBG: %s=percounter for %d tasks: %zu Graph invocations of %zu Definitions (%" PRIu64
-            " body tasks) are not run by percounter lanes; keeping the default scheduler selection",
-            SCHEDULER_TYPE_ENV, total_tasks, graph.invocations.size(), graph.templates.size(),
-            graph.layout.body_task_count
-        );
-        return StateSelection::DEFAULT;
-    }
-
     std::vector<int32_t> edges;
     std::vector<size_t> edge_begin(task_count, 0);
     uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
@@ -299,8 +289,10 @@ inline StateSelection select_percounter_state(
     );
     LOG_INFO(
         "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
-        " MIX list entries, %" PRIu64 " sync cohorts, %zu edges)",
-        total_tasks, order_count[0], order_count[1], mix_order_count, sync_cohort_count, edges.size()
+        " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
+        " body tasks)",
+        total_tasks, order_count[0], order_count[1], mix_order_count, sync_cohort_count, edges.size(),
+        graph.invocations.size(), graph.templates.size(), graph.layout.body_task_count
     );
     return StateSelection::PERCOUNTER;
 }

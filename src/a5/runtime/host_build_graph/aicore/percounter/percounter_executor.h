@@ -103,6 +103,8 @@ struct LaneConfig {
     __gm__ uint64_t *fanin_addresses;
     __gm__ PercounterCounter *counters;
     uint64_t task_count;
+    // Ids below this are task-table tasks; the rest are Graph body tasks.
+    uint64_t table_task_count;
     uint64_t order_count;
     // Whether any task carries a dispatch predicate; a graph without one never
     // reads the predicate words.
@@ -161,6 +163,9 @@ struct PercounterMixClaim {
     // Set once a draw comes back past the end of the list, so a cluster with
     // nothing left to claim stops adding to the shared draw point.
     bool list_spent;
+    // A position drawn whose entry the AICPU has not published yet, or -1. The
+    // claim holds it, as it holds an unready task, until it can read it.
+    int64_t position;
 };
 
 /** What a lane carries between its loop and the waits it makes from it. */
@@ -196,30 +201,107 @@ inline __aicore__ PercounterFaninView percounter_fanin_view(const LaneConfig &cf
     return view;
 }
 
-/**
- * One pass over `task_id`'s producers: true when every one has published.
- *
- * Never blocks, which is what lets a lane hold a range without serialising on
- * its head. It stops at the first unpublished producer, so an unready task
- * costs as little as one load and a ready one costs one per producer.
- */
-inline __aicore__ bool percounter_fanin_ready(const LaneConfig &cfg, int64_t task_id) {
-    const PercounterFaninView view = percounter_fanin_view(cfg, task_id);
-    for (int32_t i = 0; i < view.count; ++i) {
-        if (!percounter_counter_published(percounter_observe(scheduler_gm_query(view.addresses[i])))) return false;
-    }
-    return true;
-}
-
 inline __aicore__ void percounter_fail(const LaneConfig &cfg, SchedulerGraphResult result) {
     // First error wins.
     scheduler_gm_compare_exchange(cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(result));
 }
 
+/**
+ * A task as a lane runs it: where its storage is, what it waits on, and what
+ * its completion publishes.
+ *
+ * A task-table task is its own storage index and has a fanin row of counter
+ * addresses. A Graph body task lives in its invocation's storage at its body
+ * index; a root waits on its shell's fanin row, any other on its producers'
+ * body indices, and a sink also publishes its shell.
+ */
+struct PercounterTask {
+    int64_t id;     // percounter id: the counter it publishes
+    int64_t local;  // index into `graph`
+    SchedulerGraphView graph;
+    int64_t shell;  // -1 for a task-table task
+    bool sink;
+    // `fanin` holds producer body indices, to add to `body_base`; otherwise
+    // producer counter addresses.
+    bool body_fanin;
+    int32_t fanin_count;
+    __gm__ uint64_t *fanin;
+    int64_t body_base;
+};
+
+/**
+ * Resolve `id` into a task. False, with the lane error set, for an id outside
+ * the graph or a body task whose line the AICPU has not written.
+ *
+ * A body task's line is read once its entry is published, and the AICPU wrote
+ * and flushed it before publishing; the invalidate drops whatever this core
+ * held of it from an earlier run. Its counter word changes under other cores'
+ * atomics, but nothing here reads it.
+ */
+inline __aicore__ bool percounter_resolve(const LaneConfig &cfg, int64_t id, PercounterTask *task) {
+    if (id < 0 || static_cast<uint64_t>(id) >= cfg.task_count) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
+        return false;
+    }
+    if (static_cast<uint64_t>(id) < cfg.table_task_count) {
+        const PercounterFaninView view = percounter_fanin_view(cfg, id);
+        *task = PercounterTask{id, id, cfg.graph, -1, false, false, view.count, view.addresses, 0};
+        return true;
+    }
+    __gm__ PercounterCounter *line = &cfg.counters[id];
+    scheduler_observe_cache_line(line);
+    const uint64_t storage = line->storage_address;
+    const uint32_t body_index = line->body_index;
+    const uint32_t flags = line->flags;
+    const uint32_t shell = line->shell_task_id;
+    if (storage == 0 || static_cast<uint64_t>(shell) >= cfg.table_task_count || static_cast<int64_t>(body_index) > id) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
+        return false;
+    }
+    task->id = id;
+    task->local = body_index;
+    task->graph = SchedulerGraphView{storage, 0, static_cast<uint64_t>(body_index) + 1, 0};
+    task->shell = shell;
+    task->sink = (flags & PERCOUNTER_BODY_SINK) != 0;
+    task->body_base = id - static_cast<int64_t>(body_index);
+    if ((flags & PERCOUNTER_BODY_ROOT) != 0) {
+        const PercounterFaninView view = percounter_fanin_view(cfg, shell);
+        task->body_fanin = false;
+        task->fanin_count = view.count;
+        task->fanin = view.addresses;
+    } else {
+        task->body_fanin = true;
+        task->fanin_count = static_cast<int32_t>(line->fanin_count);
+        task->fanin = scheduler_state_at<uint64_t>(cfg.control, line->fanin_offset);
+    }
+    return true;
+}
+
+/** The counter address of `task`'s producer `i`. */
+inline __aicore__ uint64_t percounter_producer(const LaneConfig &cfg, const PercounterTask &task, int32_t i) {
+    const uint64_t value = scheduler_gm_query(task.fanin[i]);
+    if (!task.body_fanin) return value;
+    return reinterpret_cast<uint64_t>(&cfg.counters[static_cast<uint64_t>(task.body_base) + value].value);
+}
+
+/**
+ * One pass over `task`'s producers: true when every one has published.
+ *
+ * Never blocks, which is what lets a lane hold a range without serialising on
+ * its head. It stops at the first unpublished producer, so an unready task
+ * costs as little as one load and a ready one costs one per producer.
+ */
+inline __aicore__ bool percounter_fanin_ready(const LaneConfig &cfg, const PercounterTask &task) {
+    for (int32_t i = 0; i < task.fanin_count; ++i) {
+        if (!percounter_counter_published(percounter_observe(percounter_producer(cfg, task, i)))) return false;
+    }
+    return true;
+}
+
 /** The task's kernel id per subtask slot; negative where the slot is unused. */
-inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const LaneConfig &cfg, int64_t task_id) {
+inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const PercounterTask &task) {
     return reinterpret_cast<__gm__ int32_t *>(
-        scheduler_graph_descriptor(cfg.graph, task_id) + SCHEDULER_GRAPH_KERNEL_IDS_OFFSET
+        scheduler_graph_descriptor(task.graph, task.local) + SCHEDULER_GRAPH_KERNEL_IDS_OFFSET
     );
 }
 
@@ -241,11 +323,11 @@ inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const LaneConfig &cfg, i
  * payload cannot be resolved.
  */
 inline __aicore__ bool percounter_launch_kernel(
-    const LaneConfig &cfg, int64_t task_id, int32_t subtask_slot, int32_t kernel_id, int32_t block_idx,
+    const LaneConfig &cfg, const PercounterTask &task, int32_t subtask_slot, int32_t kernel_id, int32_t block_idx,
     int32_t block_num, uint64_t *kernel_start
 ) {
     if (cfg.has_predicates) {
-        const SchedulerPredicateResult verdict = scheduler_evaluate_task_predicate(cfg.graph, task_id);
+        const SchedulerPredicateResult verdict = scheduler_evaluate_task_predicate(task.graph, task.local);
         if (verdict == SchedulerPredicateResult::MALFORMED) {
             // First error wins, so the caller's INVALID_CALLABLE does not replace it.
             percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS);
@@ -260,8 +342,10 @@ inline __aicore__ bool percounter_launch_kernel(
         )) {
         return false;
     }
-    const SchedulerTaskInfo info{task_id, kernel_id, subtask_slot, subtask_slot == 0 ? CoreType::AIC : CoreType::AIV};
-    if (scheduler_materialize_task_payload_resolved(cfg.graph, info, function_address, cfg.payload) !=
+    const SchedulerTaskInfo info{
+        task.local, kernel_id, subtask_slot, subtask_slot == 0 ? CoreType::AIC : CoreType::AIV
+    };
+    if (scheduler_materialize_task_payload_resolved(task.graph, info, function_address, cfg.payload) !=
         SchedulerGraphResult::OK) {
         return false;
     }
@@ -288,32 +372,38 @@ inline __aicore__ bool percounter_launch_kernel(
  * nothing, leaves `kernel_start` untouched, and is published like any other.
  */
 inline __aicore__ bool percounter_run_task(
-    const LaneConfig &cfg, int64_t task_id, int32_t block_idx, int32_t block_num, uint64_t *kernel_start
+    const LaneConfig &cfg, const PercounterTask &task, int32_t block_idx, int32_t block_num, uint64_t *kernel_start
 ) {
     scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(cfg.payload));
-    __gm__ int32_t *kernel_ids = percounter_kernel_ids(cfg, task_id);
+    __gm__ int32_t *kernel_ids = percounter_kernel_ids(task);
     for (int32_t slot = 0; slot < PLATFORM_CORES_PER_BLOCKDIM; ++slot) {
         const int32_t kernel_id = kernel_ids[slot];
         if (kernel_id >= 0)
-            return percounter_launch_kernel(cfg, task_id, slot, kernel_id, block_idx, block_num, kernel_start);
+            return percounter_launch_kernel(cfg, task, slot, kernel_id, block_idx, block_num, kernel_start);
     }
     return true;
 }
 
 /** Run this lane's own subtask of one block of a MIX task. */
 inline __aicore__ bool percounter_run_subtask(
-    const LaneConfig &cfg, int64_t task_id, int32_t subtask_slot, int32_t block_idx, int32_t block_num,
+    const LaneConfig &cfg, const PercounterTask &task, int32_t subtask_slot, int32_t block_idx, int32_t block_num,
     uint64_t *kernel_start
 ) {
     scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(cfg.payload));
-    const int32_t kernel_id = percounter_kernel_ids(cfg, task_id)[subtask_slot];
+    const int32_t kernel_id = percounter_kernel_ids(task)[subtask_slot];
     if (kernel_id < 0) return true;
-    return percounter_launch_kernel(cfg, task_id, subtask_slot, kernel_id, block_idx, block_num, kernel_start);
+    return percounter_launch_kernel(cfg, task, subtask_slot, kernel_id, block_idx, block_num, kernel_start);
 }
 
-/** Record `count` finished subtasks of `task_id`; called after their store barriers. */
-inline __aicore__ void percounter_publish_completion(const LaneConfig &cfg, int64_t task_id, uint64_t count) {
-    scheduler_gm_fetch_add(cfg.counters[task_id].value, count);
+/**
+ * Record `count` finished subtasks of `task`; called after their store
+ * barriers. A body sink's subtasks also count toward its shell, whose counter
+ * is preset against every sink subtask of the body.
+ */
+inline __aicore__ void
+percounter_publish_completion(const LaneConfig &cfg, const PercounterTask &task, uint64_t count) {
+    scheduler_gm_fetch_add(cfg.counters[task.id].value, count);
+    if (task.sink) scheduler_gm_fetch_add(cfg.counters[task.shell].value, count);
 }
 
 /** True when the lane should stop: EXIT is signalled or some lane has failed. */
@@ -367,9 +457,15 @@ inline __aicore__ bool percounter_clear_mix_signal(const LaneConfig &cfg, uint64
     return true;
 }
 
-/** The subtask slots a task occupies, as a bitmask over {AIC, AIV0, AIV1}. */
-inline __aicore__ uint32_t percounter_mix_active_mask(const LaneConfig &cfg, int64_t task_id) {
-    __gm__ int32_t *kernel_ids = percounter_kernel_ids(cfg, task_id);
+/**
+ * The subtask slots a task occupies, as a bitmask over {AIC, AIV0, AIV1}. Read
+ * outside a kernel run, so the descriptor line is invalidated first: a body
+ * task's descriptor is written by the AICPU, into a heap this core may have
+ * cached in an earlier run.
+ */
+inline __aicore__ uint32_t percounter_mix_active_mask(const PercounterTask &task) {
+    __gm__ int32_t *kernel_ids = percounter_kernel_ids(task);
+    scheduler_observe_cache_line(kernel_ids);
     uint32_t mask = 0;
     for (uint32_t slot = 0; slot < PLATFORM_CORES_PER_BLOCKDIM; ++slot) {
         if (kernel_ids[slot] >= 0) mask |= uint32_t{1} << slot;
@@ -457,10 +553,10 @@ inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
  * sequence number is taken first, and the trailing promote covers the slot
  * falling free between this lane's two steps.
  */
-inline __aicore__ void percounter_sync_enqueue(const LaneConfig &cfg, int64_t task_id, int32_t block_num) {
-    const uint32_t mask = percounter_mix_active_mask(cfg, task_id);
+inline __aicore__ void percounter_sync_enqueue(const LaneConfig &cfg, const PercounterTask &task, int32_t block_num) {
+    const uint32_t mask = percounter_mix_active_mask(task);
     const uint64_t seq = scheduler_gm_fetch_add(cfg.sync_queue->tail, uint64_t{1});
-    scheduler_gm_store(cfg.sync_pending[seq], percounter_sync_desc(task_id, static_cast<uint32_t>(block_num), mask));
+    scheduler_gm_store(cfg.sync_pending[seq], percounter_sync_desc(task.id, static_cast<uint32_t>(block_num), mask));
     percounter_sync_promote(cfg);
 }
 
@@ -491,14 +587,14 @@ inline __aicore__ int32_t percounter_sync_take_block(const LaneConfig &cfg, uint
 inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state) {
     PercounterSyncState *sync = &state->sync;
     if ((sync->active_mask & (sync->active_mask - 1U)) == 0) {
+        PercounterTask task{};
+        if (!percounter_resolve(cfg, sync->task_id, &task)) return false;
         uint64_t kernel_start = 0;
-        if (!percounter_run_task(
-                cfg, sync->task_id, sync->my_block, static_cast<int32_t>(sync->block_num), &kernel_start
-            )) {
+        if (!percounter_run_task(cfg, task, sync->my_block, static_cast<int32_t>(sync->block_num), &kernel_start)) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             return false;
         }
-        percounter_publish_completion(cfg, sync->task_id, uint64_t{1});
+        percounter_publish_completion(cfg, task, uint64_t{1});
         ++state->local_done;
         sync->my_block = -1;
         scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
@@ -623,28 +719,31 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
     if (percounter_mix_armed(generation)) return;
 
     if (claim->task_id < 0) {
-        if (claim->list_spent) return;
-        const uint64_t draw = scheduler_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DRAW].next, uint64_t{1});
-        if (draw >= cfg.mix_order_count) {
-            claim->list_spent = true;
-            return;
+        if (claim->position < 0) {
+            if (claim->list_spent) return;
+            const uint64_t draw = scheduler_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DRAW].next, uint64_t{1});
+            if (draw >= cfg.mix_order_count) {
+                claim->list_spent = true;
+                return;
+            }
+            claim->position = static_cast<int64_t>(draw);
         }
-        const uint64_t entry = scheduler_gm_query(cfg.mix_order[draw]);
-        const int64_t task_id = percounter_order_task_id(entry);
-        if (task_id < 0 || static_cast<uint64_t>(task_id) >= cfg.task_count) {
-            percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
-            return;
-        }
-        claim->task_id = task_id;
+        // A Graph body's entry reads zero until the AICPU has materialized it.
+        const uint64_t entry = scheduler_gm_query(cfg.mix_order[claim->position]);
+        if (percounter_order_block_num(entry) == 0) return;
+        claim->position = -1;
+        claim->task_id = percounter_order_task_id(entry);
         claim->block_idx = percounter_order_block_idx(entry);
         claim->block_num = percounter_order_block_num(entry);
     }
-    if (!percounter_fanin_ready(cfg, claim->task_id)) return;
+    PercounterTask task{};
+    if (!percounter_resolve(cfg, claim->task_id, &task)) return;
+    if (!percounter_fanin_ready(cfg, task)) return;
 
     // A sync-start MIX task's single arming entry queues the cohort instead of
     // arming this cluster; its blocks are handed out from the queue.
     if (claim->block_idx == PERCOUNTER_ORDER_BLOCK_IDX_ARM) {
-        percounter_sync_enqueue(cfg, claim->task_id, claim->block_num);
+        percounter_sync_enqueue(cfg, task, claim->block_num);
         claim->task_id = -1;
         return;
     }
@@ -652,7 +751,7 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
     // The payload before the generation, and the generation with release
     // ordering: a lane that observes an odd generation observes its payload.
     signal->task_id = claim->task_id;
-    signal->active_mask = percounter_mix_active_mask(cfg, claim->task_id);
+    signal->active_mask = percounter_mix_active_mask(task);
     signal->block_idx = claim->block_idx;
     signal->block_num = claim->block_num;
     // Every arming: the previous rendezvous on this line may have been a
@@ -761,11 +860,9 @@ inline __aicore__ bool percounter_serve_mix(
 ) {
     SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
     const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
-    if (task_id < 0 || static_cast<uint64_t>(task_id) >= cfg.task_count) {
-        percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
-        return false;
-    }
-    if (!percounter_fanin_ready(cfg, task_id)) {
+    PercounterTask task{};
+    if (!percounter_resolve(cfg, task_id, &task)) return false;
+    if (!percounter_fanin_ready(cfg, task)) {
         percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS);
         return false;
     }
@@ -775,7 +872,7 @@ inline __aicore__ bool percounter_serve_mix(
     // Inside the kernel this lane polls nothing. Every participant has arrived,
     // so a cross-core channel wait in it has a peer to meet.
     uint64_t kernel_start = 0;
-    if (!percounter_run_subtask(cfg, task_id, cfg.cluster_lane, block_idx, block_num, &kernel_start)) {
+    if (!percounter_run_subtask(cfg, task, cfg.cluster_lane, block_idx, block_num, &kernel_start)) {
         percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
         return false;
     }
@@ -787,7 +884,7 @@ inline __aicore__ bool percounter_serve_mix(
         if (!percounter_mix_wait(cfg, signal->finished, mask, generation, timeout_cycles)) return false;
         // The counter was preset against the task's whole subtask total, so
         // this add carries the block's share of it at once.
-        percounter_publish_completion(cfg, task_id, static_cast<uint64_t>(__builtin_popcount(mask)));
+        percounter_publish_completion(cfg, task, static_cast<uint64_t>(__builtin_popcount(mask)));
         // After the task counter: a lane that sees either count reach its total
         // may stop, and no consumer of the task may still be waiting then.
         if (cohort_block) scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
@@ -904,11 +1001,11 @@ percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
  * Returns false on EXIT, on another lane's error, or when this producer has
  * been late past the watchdog, which it records as this lane's error.
  */
-inline __aicore__ bool
-percounter_wait_for_fanin(const LaneConfig &cfg, int64_t task_id, PercounterLaneState *state, uint64_t timeout_cycles) {
-    const PercounterFaninView view = percounter_fanin_view(cfg, task_id);
-    for (int32_t i = 0; i < view.count; ++i) {
-        const uint64_t address = scheduler_gm_query(view.addresses[i]);
+inline __aicore__ bool percounter_wait_for_fanin(
+    const LaneConfig &cfg, const PercounterTask &task, PercounterLaneState *state, uint64_t timeout_cycles
+) {
+    for (int32_t i = 0; i < task.fanin_count; ++i) {
+        const uint64_t address = percounter_producer(cfg, task, i);
         uint64_t start = get_sys_cnt_aicore();
         uint32_t checks = 0;
         uint32_t sync_checks = 0;
@@ -953,6 +1050,54 @@ percounter_wait_for_fanin(const LaneConfig &cfg, int64_t task_id, PercounterLane
 }
 
 /**
+ * Block until the AICPU publishes the entry at `slot`, which is in a Graph
+ * body's range, and return it in `entry`.
+ *
+ * The same checkpoints as the fanin wait, for the same reason: this lane may be
+ * what a rendezvous or a cohort is waiting for. The AICPU materializes without
+ * waiting on any lane, so the entry comes in bounded time; a failure there
+ * reaches this lane as EXIT once the supervisor ends the run.
+ */
+inline __aicore__ bool percounter_wait_for_entry(
+    const LaneConfig &cfg, __gm__ uint64_t *slot, PercounterLaneState *state, uint64_t timeout_cycles, uint64_t *entry
+) {
+    uint64_t start = get_sys_cnt_aicore();
+    uint32_t checks = 0;
+    uint64_t misses = 0;
+    while (true) {
+        const uint64_t value = scheduler_gm_query(*slot);
+        if (percounter_order_block_num(value) != 0) {
+            *entry = value;
+            return true;
+        }
+        bool served = false;
+        if (!percounter_checkpoint_serve(cfg, state, timeout_cycles, &served)) return false;
+        if (served) {
+            start = get_sys_cnt_aicore();
+            misses = 0;
+            checks = 0;
+            continue;
+        }
+        if (++misses > PERCOUNTER_SPIN_BACKOFF_AFTER) {
+            const uint64_t until = get_sys_cnt_aicore() + PERCOUNTER_SPIN_BACKOFF_CYCLES;
+            while (get_sys_cnt_aicore() < until) {}
+        }
+        if (++checks == PERCOUNTER_SPIN_CHECK_INTERVAL) {
+            checks = 0;
+            if (percounter_should_stop(cfg)) return false;
+            percounter_mix_tick(cfg, state);
+            if (!percounter_sync_take(cfg, state, timeout_cycles, &served)) return false;
+            if (served) start = get_sys_cnt_aicore();
+            if (scheduler_watchdog_expired(start, get_sys_cnt_aicore(), timeout_cycles)) {
+                percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
+                return false;
+            }
+        }
+        SPIN_WAIT_HINT();
+    }
+}
+
+/**
  * The lane loop.
  *
  * Every lane of a core type draws from that type's single ticket, and a draw
@@ -980,9 +1125,15 @@ percounter_wait_for_fanin(const LaneConfig &cfg, int64_t task_id, PercounterLane
  * producer that is a lower position in this same range, which only this lane
  * can run. The lowest cannot: every position before it in the list is complete
  * or held by another lane, so it is the one the deadlock argument names.
+ *
+ * A position in a Graph body's range may not be published yet. The scan passes
+ * over it, and the fallback waits for it: the AICPU publishes it without
+ * waiting on any lane, so the argument is unchanged.
  */
 inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t timeout_cycles) {
-    PercounterLaneState state{0, 0, PercounterMixClaim{-1, 0, 1, false}, PercounterSyncState{0, 0, -1, -1, 0, 0, 0}};
+    PercounterLaneState state{
+        0, 0, PercounterMixClaim{-1, 0, 1, false, -1}, PercounterSyncState{0, 0, -1, -1, 0, 0, 0}
+    };
     uint64_t range_first = 0;
     uint32_t pending = 0;
     // A range withholds its positions from every other lane, which pays with
@@ -1025,45 +1176,49 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
 
         uint32_t slot = 0;
         bool found = false;
-        int64_t task_id = -1;
+        PercounterTask task{};
         uint64_t entry = 0;
+        bool failed = false;
         for (uint32_t probe = pending; probe != 0; probe &= probe - 1) {
             const uint32_t candidate = static_cast<uint32_t>(__builtin_ctz(probe));
             const uint64_t candidate_entry = scheduler_gm_query(cfg.order[range_first + candidate]);
-            const int64_t id = percounter_order_task_id(candidate_entry);
-            if (id < 0 || static_cast<uint64_t>(id) >= cfg.task_count) {
-                percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
-                return;
+            // A Graph body's entry reads zero until the AICPU publishes it.
+            if (percounter_order_block_num(candidate_entry) == 0) continue;
+            PercounterTask candidate_task{};
+            if (!percounter_resolve(cfg, percounter_order_task_id(candidate_entry), &candidate_task)) {
+                failed = true;
+                break;
             }
-            if (id == proven_task || percounter_fanin_ready(cfg, id)) {
+            if (candidate_task.id == proven_task || percounter_fanin_ready(cfg, candidate_task)) {
                 slot = candidate;
-                task_id = id;
+                task = candidate_task;
                 entry = candidate_entry;
                 found = true;
                 break;
             }
         }
+        if (failed) break;
         if (!found) {
             slot = static_cast<uint32_t>(__builtin_ctz(pending));
-            entry = scheduler_gm_query(cfg.order[range_first + slot]);
-            task_id = percounter_order_task_id(entry);
+            if (!percounter_wait_for_entry(cfg, &cfg.order[range_first + slot], &state, timeout_cycles, &entry)) break;
+            if (!percounter_resolve(cfg, percounter_order_task_id(entry), &task)) break;
         }
         pending &= ~(uint32_t{1} << slot);
         // Only the blocking path waits: the scan above already read a ready
         // task's producers to the end.
-        if (!found && !percounter_wait_for_fanin(cfg, task_id, &state, timeout_cycles)) break;
-        proven_task = task_id;
+        if (!found && !percounter_wait_for_fanin(cfg, task, &state, timeout_cycles)) break;
+        proven_task = task.id;
 
         // A sync-start task's single entry queues the cohort once its fanin is
         // ready. Its blocks are counted where they run, not here.
         if (percounter_order_is_arming(entry)) {
-            percounter_sync_enqueue(cfg, task_id, percounter_order_block_num(entry));
+            percounter_sync_enqueue(cfg, task, percounter_order_block_num(entry));
             continue;
         }
 
         uint64_t kernel_start = 0;
         if (!percounter_run_task(
-                cfg, task_id, percounter_order_block_idx(entry), percounter_order_block_num(entry), &kernel_start
+                cfg, task, percounter_order_block_idx(entry), percounter_order_block_num(entry), &kernel_start
             )) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             break;
@@ -1072,7 +1227,7 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
             batch = get_sys_cnt_aicore() - kernel_start >= PERCOUNTER_LONG_KERNEL_CYCLES ? 1 : PERCOUNTER_CLAIM_BATCH;
         }
 
-        percounter_publish_completion(cfg, task_id, uint64_t{1});
+        percounter_publish_completion(cfg, task, uint64_t{1});
         if (++state.local_done >= PERCOUNTER_COMPLETION_BATCH) percounter_flush_done(cfg, &state);
     }
     percounter_flush_done(cfg, &state);
@@ -1121,6 +1276,7 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.fanin_addresses = scheduler_state_at<uint64_t>(control, scheduler_gm_query(control->fanin_addr_offset));
     cfg.counters = scheduler_state_at<PercounterCounter>(control, scheduler_gm_query(control->counters_offset));
     cfg.task_count = scheduler_gm_query(control->task_count);
+    cfg.table_task_count = scheduler_gm_query(control->table_task_count);
     cfg.order_count = scheduler_gm_query(control->order_count[type_index]);
     cfg.has_predicates = scheduler_gm_query(control->has_predicates) != 0;
     cfg.cluster_index = coordinate.cluster_index;
