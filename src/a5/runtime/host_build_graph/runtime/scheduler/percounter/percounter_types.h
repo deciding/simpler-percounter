@@ -1,0 +1,533 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+/**
+ * The percounter scheduler's GM wire structs, shared by the host that builds
+ * them, the AICPU that publishes the topology into them, and the AICore lanes
+ * that read them.
+ *
+ * Host-only planning (the layout planner and the table builder) lives in
+ * host/percounter/percounter_plan.h; this header is compiled by the AICore
+ * target too, so it includes nothing host-only.
+ *
+ * Every offset here is from the region base, never a pointer, so the whole
+ * region survives one memcpy to the device.
+ */
+
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+#include "scheduler/scheduler_layout.h"
+#include "scheduler/scheduler_ssbuf.h"
+#include "scheduler/scheduler_types.h"
+
+namespace simpler::hbg::percounter {
+
+inline constexpr uint32_t PERCOUNTER_CORE_TYPE_COUNT = 2;  // 0 = AIC, 1 = AIV
+
+/**
+ * One cluster's MIX rendezvous line. Lives in SSBUF, not in the GM region.
+ *
+ * SSBUF offers no atomics -- scheduler_ssbuf.h has relaxed and acquire/release
+ * load/store and nothing else -- so every field here has exactly one writer.
+ * `task_id`, `armed_generation`, `active_mask`, `block_idx`, `block_num` and
+ * `cohort_block` are written only by the cluster's AIV0, which is why the
+ * claimer is a fixed lane role rather than an election; entry `i` of the two
+ * arrays is written only by cluster lane `i`.
+ *
+ * `armed_generation` is monotone with odd meaning armed, so one word carries
+ * both the generation and the free/busy state, and a value never returns to
+ * mean something else. The arrays hold the generation a lane joined at rather
+ * than a flag, so an arrival left over from an older generation reads back as
+ * absent. Both properties need the line cleared before any lane reads it:
+ * SSBUF survives a launch, and a stale odd value would send a lane after a
+ * stale task id.
+ *
+ * Every field is `volatile`: each is read by lanes that did not write it, mostly
+ * inside a spin, and a plain member would let the compiler hoist the load.
+ */
+struct alignas(64) PercounterMixSignal {
+    volatile int64_t task_id;
+    volatile uint32_t armed_generation;  // odd = armed, even = free
+    volatile uint32_t active_mask;
+    volatile uint32_t arrived[PLATFORM_CORES_PER_BLOCKDIM];   // entry i written by cluster lane i
+    volatile uint32_t finished[PLATFORM_CORES_PER_BLOCKDIM];  // entry i written by cluster lane i
+    // A MIX task with `block_num > 1` is one rendezvous per block, so the block
+    // is part of the payload and moves under the same release as the task id.
+    volatile int32_t block_idx;
+    volatile int32_t block_num;
+    // Non-zero when this arming is one block of a sync cohort rather than a draw
+    // from the MIX list: the rendezvous is identical, but its end is reported to
+    // the cohort record instead of to the MIX done ticket.
+    volatile uint32_t cohort_block;
+    uint32_t reserved[3];
+};
+static_assert(sizeof(PercounterMixSignal) == 64, "the MIX signal owns exactly one cache line");
+static_assert(alignof(PercounterMixSignal) == 64, "two clusters must not share a line");
+static_assert(std::is_standard_layout_v<PercounterMixSignal>);
+
+/**
+ * Percounter's view of the SSBUF bytes HBG owns.
+ *
+ * The same bytes resident lays out as SchedulerSsbufRegion, as a separate type:
+ * the two schedulers never run in the same launch, and the resident layout is a
+ * per-lane dispatch and completion mailbox percounter has no use for.
+ */
+struct alignas(64) PercounterSsbufRegion {
+    PercounterMixSignal mix;
+    uint8_t reserved[SCHEDULER_SSBUF_REGION_SIZE - sizeof(PercounterMixSignal)];
+};
+static_assert(sizeof(PercounterSsbufRegion) == SCHEDULER_SSBUF_REGION_SIZE);
+
+inline __aicore__ SCHEDULER_SSBUF PercounterSsbufRegion *percounter_ssbuf_region(uint64_t hardware_base) {
+    return reinterpret_cast<SCHEDULER_SSBUF PercounterSsbufRegion *>(hardware_base + SCHEDULER_SSBUF_REGION_OFFSET);
+}
+
+/**
+ * Put the cluster's line in the state the protocol starts from.
+ *
+ * SSBUF survives a launch, so nothing the host does covers this. Only the
+ * cluster's AIV0 calls it, and only before any lane of the cluster has read the
+ * line, which the per-cluster ready word in GM establishes.
+ */
+inline __aicore__ void percounter_mix_signal_clear(SCHEDULER_SSBUF PercounterMixSignal *signal) {
+    signal->task_id = -1;
+    signal->active_mask = 0;
+    signal->block_idx = 0;
+    signal->block_num = 1;
+    signal->cohort_block = 0;
+    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+        signal->arrived[lane] = 0;
+        signal->finished[lane] = 0;
+    }
+    // Last, with release ordering: a lane that sees an even generation must see
+    // the cleared payload behind it.
+    scheduler_ssbuf_store_release(&signal->armed_generation, 0);
+}
+
+/** Whether the cluster's slot currently holds a task. */
+inline __aicore__ bool percounter_mix_armed(uint32_t generation) { return (generation & 1U) != 0; }
+
+/**
+ * One ticket per core type, drawn by every lane of that type.
+ *
+ * Sharding a ticket per cluster would make the shards fixed partitions: a
+ * cluster would be committed to positions `c, c+C, c+2C, ...` of its list, and a
+ * lane whose share is blocked could not take work another cluster holds. One
+ * ticket per type keeps the queue work-conserving -- whichever lane is free
+ * draws next -- at the cost of putting every lane of a type on one cache line.
+ * A ticket serves one draw per ~170 cycles however many lanes share it, so it
+ * limits a run only while a lane's whole task takes less than that times the
+ * lane count; PERCOUNTER_CLAIM_BATCH divides the draws.
+ */
+inline constexpr uint32_t PERCOUNTER_TICKET_CAPACITY = 1;
+
+/**
+ * One counter per 64 B cache line.
+ *
+ * The atomic unit serialises per line rather than per address, so N counters
+ * sharing a line cost N times the latency: 6371 cycles for 16 per line against
+ * 446 for one, measured on a5. Packing would stay correct -- no update is lost --
+ * only slow.
+ */
+struct alignas(64) PercounterCounter {
+    // 64-bit to match scheduler_gm_fetch_add, the runtime's only atomic add.
+    uint64_t value;
+    uint8_t reserved[56];
+};
+static_assert(sizeof(PercounterCounter) == 64, "a counter owns exactly one cache line");
+static_assert(alignof(PercounterCounter) == 64, "counters must not straddle lines");
+
+/**
+ * A counter is published when it reads **positive as a signed value**.
+ *
+ * The host presets it to `1 - total_subtasks` and every subtask adds one, so the
+ * value walks `1 - total .. 0` and lands on exactly 1. Nothing has to detect the
+ * last arriver, so a task of N subtasks costs N atomics, not N + 1.
+ *
+ * Signed `> 0` rather than `== 1`: an equality test would turn a counter that
+ * overshot into a consumer that waits forever. With `> 0`, a defect that ran a
+ * subtask twice shows up as a wrong result rather than as an op timeout.
+ *
+ * A task completed inline at bind is preset to 1 directly, the value it would
+ * have reached.
+ */
+inline constexpr uint64_t PERCOUNTER_COUNTER_PUBLISHED = 1;
+
+inline __aicore__ bool percounter_counter_published(uint64_t value) { return static_cast<int64_t>(value) > 0; }
+
+inline constexpr uint64_t percounter_counter_preset(int64_t total_subtasks) {
+    return static_cast<uint64_t>(static_cast<int64_t>(PERCOUNTER_COUNTER_PUBLISHED) - total_subtasks);
+}
+
+/** A ticket, line-isolated for the same reason the counters are. */
+struct alignas(64) PercounterTicket {
+    uint64_t next;
+    uint8_t reserved[56];
+};
+static_assert(sizeof(PercounterTicket) == 64, "a ticket owns exactly one cache line");
+
+// The MIX list takes two tickets where each core-type list takes one: a draw
+// point at index 0 and a completion count at index 1. The exit rule needs the
+// second. Consuming the draw and arming the slot are two steps, so between them
+// the lane that took the last MIX task shows its cluster "the list is claimed
+// out" while its own slot still reads free, and its peers would leave right
+// before it needed them. A count of *completed* MIX tasks rises only after a
+// rendezvous is over.
+inline constexpr uint32_t PERCOUNTER_MIX_TICKET_COUNT = 2;
+inline constexpr uint32_t PERCOUNTER_MIX_TICKET_DRAW = 0;
+inline constexpr uint32_t PERCOUNTER_MIX_TICKET_DONE = 1;
+
+/**
+ * The sync-start cohorts waiting to be gathered, as a queue.
+ *
+ * **An order list hands out work that may run one after another; a cohort's
+ * blocks must run at the same time.** So a cohort's blocks are in no list: the
+ * task holds a single *arming* entry (PERCOUNTER_ORDER_BLOCK_IDX_ARM), and its
+ * blocks are handed out from here.
+ *
+ * **Only the open cohort may be claimed from, and it leaves the slot the moment
+ * it is fully claimed, not when it finishes.**
+ *
+ * The first rule is what makes a queue safe without revocation. The state
+ * nothing can resolve is two cohorts each holding part of the pool -- 32
+ * clusters, two cohorts of 24 holding 20 each, neither able to fill. With one
+ * claimable at a time there is never more than one partially claimed cohort,
+ * and the open one always fills, because the orchestrator refuses any cohort
+ * wider than its pool.
+ *
+ * The second rule holds the open slot for the gather alone rather than the whole
+ * execution, so the next cohort is already collecting claims while the previous
+ * one runs. A lane holding a block therefore cannot read the record to learn its
+ * cohort filled; `released` answers that. Cohorts are promoted in sequence
+ * order, so a holder of sequence `s` runs once `released > s`.
+ */
+struct alignas(64) PercounterSyncQueue {
+    // The open cohort. A graph with no cohort currently open pays one load on
+    // this line and nothing else.
+    uint64_t open_generation;  // even = free, odd = open; CAS to take the slot
+    int64_t open_task_id;      // -1 = slot taken, payload not published yet
+    uint32_t open_block_num;
+    uint32_t open_active_mask;
+    uint64_t open_seq;  // this cohort's position in the promotion order
+    uint64_t open_armed_cycles;
+    uint8_t reserved0[24];
+    // Claims against the open cohort, the generation in the upper half so a
+    // stale read cannot consume a block of the cohort that replaced it.
+    alignas(64) uint64_t arrived;
+    uint8_t reserved1[56];
+    // Promotion order: a cohort of sequence `s` has been fully claimed once this
+    // exceeds `s`. Monotone and never reused.
+    alignas(64) uint64_t released;
+    uint8_t reserved2[56];
+    // Ring cursors: `tail` hands out sequence numbers, `head` is the next to
+    // promote. Both monotone; the ring is sized to the graph's cohort count, so
+    // neither wraps.
+    alignas(64) uint64_t tail;
+    uint64_t head;
+    uint8_t reserved3[48];
+    // Cohort blocks that have actually *run*, which the exit rule waits on.
+    // `released` says only that every block has an owner. A MIX cohort block is
+    // not even run by the lane that claimed it -- the claimer arms its cluster
+    // and is free at once -- so without this count the cluster's other lanes
+    // could leave before discovering the rendezvous they are needed for.
+    alignas(64) uint64_t completed;
+    uint8_t reserved4[56];
+};
+static_assert(sizeof(PercounterSyncQueue) == 320, "the sync queue owns five isolated cache lines");
+static_assert(
+    offsetof(PercounterSyncQueue, arrived) / 64 != offsetof(PercounterSyncQueue, released) / 64,
+    "arrived is hammered once per block while released is polled by every holder"
+);
+static_assert(std::is_trivially_copyable_v<PercounterSyncQueue> && std::is_standard_layout_v<PercounterSyncQueue>);
+
+/** Whether a cohort is currently open for claims. Same parity rule as MIX. */
+inline __aicore__ bool percounter_sync_armed(uint64_t generation) { return (generation & 1U) != 0; }
+
+/**
+ * One queued cohort, packed into the word the ring stores.
+ *
+ *   bits  0..31  task id
+ *   bits 32..47  block count
+ *   bits 48..55  active-subtask mask
+ *   bit  56      valid
+ *
+ * Zero is "not written yet": a sequence number is taken before the descriptor is
+ * stored, and a promoting lane uses the valid bit to tell a reserved ring
+ * position from a published one.
+ */
+inline constexpr uint64_t PERCOUNTER_SYNC_DESC_VALID = uint64_t{1} << 56;
+
+inline __aicore__ uint64_t percounter_sync_desc(int64_t task_id, uint32_t block_num, uint32_t active_mask) {
+    return PERCOUNTER_SYNC_DESC_VALID | (static_cast<uint64_t>(active_mask & 0xffU) << 48) |
+           (static_cast<uint64_t>(block_num & 0xffffU) << 32) | (static_cast<uint64_t>(task_id) & 0xffffffffULL);
+}
+
+inline __aicore__ int64_t percounter_sync_desc_task(uint64_t desc) {
+    return static_cast<int64_t>(desc & 0xffffffffULL);
+}
+
+inline __aicore__ uint32_t percounter_sync_desc_blocks(uint64_t desc) {
+    return static_cast<uint32_t>((desc >> 32) & 0xffffULL);
+}
+
+inline __aicore__ uint32_t percounter_sync_desc_mask(uint64_t desc) {
+    return static_cast<uint32_t>((desc >> 48) & 0xffULL);
+}
+
+/**
+ * One Graph shell, for the AICPU that materializes its body.
+ *
+ * The AICPU could find the shells by walking the task table for TaskKind::GRAPH,
+ * but not which counter each one publishes: that is a percounter id, and the
+ * mapping from a table slot to one exists only on the host.
+ */
+struct PercounterShell {
+    // The percounter id of the shell itself, whose counter tells the body's
+    // roots that their storage exists.
+    uint64_t counter_id;
+    // The task-table slot the shell occupies. Materialization reads the boundary
+    // arguments and the Definition address from there and writes the body into
+    // the heap region the slot names.
+    uint64_t table_task_id;
+};
+static_assert(sizeof(PercounterShell) == 16, "percounter shell record is a wire struct");
+static_assert(std::is_trivially_copyable_v<PercounterShell> && std::is_standard_layout_v<PercounterShell>);
+
+/** Where a task's producers live in the flat fanin-address array. */
+struct PercounterFanin {
+    int32_t count;
+    int32_t begin;
+};
+static_assert(sizeof(PercounterFanin) == 8, "percounter fanin record is a wire struct");
+static_assert(std::is_trivially_copyable_v<PercounterFanin> && std::is_standard_layout_v<PercounterFanin>);
+
+/**
+ * An order-list entry names one *block* of one task and carries everything the
+ * lane needs about it in one 64-bit load:
+ *
+ *   bits  0..31  task id
+ *   bits 32..47  block index
+ *   bits 48..63  block count
+ *
+ * A task with `block_num == N` occupies N consecutive entries with the same task
+ * id and block indices 0..N-1. A side table indexed by task id would put a
+ * second device load on the readiness scan.
+ *
+ * The block count is carried here because the descriptor a lane can reach holds
+ * the task id and the kernel ids only, and `logical_block_num` lives on the
+ * AICPU-side slot state, which an AICore should not read by offset. For a
+ * single-slot task the block count is also the subtask total the counter is
+ * preset against.
+ *
+ * The orchestrator refuses any task whose `block_num * popcount(active_mask)`
+ * exceeds INT16_MAX, so both halves fit 16 bits unsigned, and a task id is
+ * non-negative and bounded by the graph's task count.
+ */
+inline constexpr uint32_t PERCOUNTER_ORDER_BLOCK_IDX_SHIFT = 32;
+inline constexpr uint32_t PERCOUNTER_ORDER_BLOCK_NUM_SHIFT = 48;
+inline constexpr uint64_t PERCOUNTER_ORDER_TASK_MASK = 0xffffffffULL;
+inline constexpr uint64_t PERCOUNTER_ORDER_BLOCK_MASK = 0xffffULL;
+
+inline __aicore__ uint64_t percounter_order_entry(int64_t task_id, int32_t block_idx, int32_t block_num) {
+    return ((static_cast<uint64_t>(block_num) & PERCOUNTER_ORDER_BLOCK_MASK) << PERCOUNTER_ORDER_BLOCK_NUM_SHIFT) |
+           ((static_cast<uint64_t>(block_idx) & PERCOUNTER_ORDER_BLOCK_MASK) << PERCOUNTER_ORDER_BLOCK_IDX_SHIFT) |
+           (static_cast<uint64_t>(task_id) & PERCOUNTER_ORDER_TASK_MASK);
+}
+
+inline __aicore__ int64_t percounter_order_task_id(uint64_t entry) {
+    return static_cast<int64_t>(entry & PERCOUNTER_ORDER_TASK_MASK);
+}
+
+inline __aicore__ int32_t percounter_order_block_idx(uint64_t entry) {
+    return static_cast<int32_t>((entry >> PERCOUNTER_ORDER_BLOCK_IDX_SHIFT) & PERCOUNTER_ORDER_BLOCK_MASK);
+}
+
+inline __aicore__ int32_t percounter_order_block_num(uint64_t entry) {
+    return static_cast<int32_t>((entry >> PERCOUNTER_ORDER_BLOCK_NUM_SHIFT) & PERCOUNTER_ORDER_BLOCK_MASK);
+}
+
+/**
+ * The block index an *arming entry* carries. A sync-start task holds exactly one
+ * list entry, and it is not a block: running it arms the cohort record, from
+ * which the blocks are handed out.
+ *
+ * The INT16_MAX cap on `block_num * popcount(active_mask)` makes this a value no
+ * real block index takes, so a lane recognises an arming duty from the entry it
+ * has already unpacked.
+ */
+inline constexpr int32_t PERCOUNTER_ORDER_BLOCK_IDX_ARM = 0xffff;
+
+inline __aicore__ bool percounter_order_is_arming(uint64_t entry) {
+    return percounter_order_block_idx(entry) == PERCOUNTER_ORDER_BLOCK_IDX_ARM;
+}
+
+/**
+ * The device-visible header: where every other segment is, and how many entries
+ * each order list holds.
+ */
+struct alignas(128) PercounterControl {
+    // Every task, including inline-completed ones; a lane bounds-checks the task
+    // id it unpacks from an entry against this.
+    uint64_t task_count;
+    // Blocks a lane will actually run and fold into its progress. Under SPMD this
+    // exceeds the task count, since a task with `block_num == N` runs N blocks;
+    // inline-completed and off-lane tasks contribute none.
+    uint64_t executable_task_count;
+    uint64_t edge_count;
+    uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT];
+    uint64_t orders_offset[PERCOUNTER_CORE_TYPE_COUNT];
+    uint64_t tickets_offset;
+    // The MIX list and its draw point. `mix_order_count == 0` is what makes a
+    // MIX-free graph cost nothing: no cluster ever arms its signal.
+    uint64_t mix_order_count;
+    uint64_t mix_order_offset;
+    uint64_t mix_ticket_offset;
+    // MIX rendezvous the done ticket will count. Not the list length: a
+    // sync-start MIX task holds one arming entry but runs `block_num`
+    // rendezvous, which report to the cohort record instead.
+    uint64_t mix_rendezvous_count;
+    // Sync-start tasks in the graph and where the queue lives; both zero when
+    // there are none.
+    uint64_t sync_cohort_count;
+    uint64_t sync_cohort_offset;
+    // Every (sync task, block) pair: what the queue's `completed` is waited on
+    // against.
+    uint64_t sync_block_total;
+    // Non-zero when any task carries a dispatch predicate. A whole-graph flag:
+    // the predicate lives on the task payload, a different line from the
+    // descriptor a lane already reads, so a per-task test would put one more
+    // device read on every task of every graph.
+    uint64_t has_predicates;
+    // Offset of the per-task ChipTaskStorage address table, or 0 when every
+    // task's storage is in the shared-memory task table and a lane computes its
+    // address. Non-zero only for a graph with Graph bodies, whose storage lives
+    // in a shell's heap.
+    uint64_t storage_addresses_offset;
+    uint64_t shell_count;
+    uint64_t shells_offset;
+    // The ring of queued cohort descriptors, one word per sync-start task, so a
+    // sequence number never wraps and no enqueue finds it full.
+    uint64_t sync_pending_offset;
+    // One word per cluster, set by its AIV0 once it has cleared the cluster's
+    // SSBUF line and read by all three lanes before they first look at it. In
+    // GM because GM is what the bind zeroes: a ready flag in SSBUF could read
+    // back set from an earlier launch.
+    uint64_t mix_signal_ready_offset;
+    uint64_t fanin_offset;
+    uint64_t fanin_addr_offset;
+    uint64_t counters_offset;
+    // Written by the AICPU after the handshake, since the cluster count is
+    // discovered at bring-up. These two are all a lane needs to place itself:
+    // scheduler_cluster_coordinate_from_worker is a pure function of them and
+    // the block index.
+    uint64_t cluster_count;
+    uint64_t aiv_per_cluster;
+    // First failure wins; the supervisor stops on any non-zero value.
+    uint64_t lane_error;
+    // Absolute device addresses resolved at bind, outside this region.
+    uint64_t graph_storage_address;
+    // Entries in the task table `graph_storage_address` points at. Not this
+    // region's task count: Graph body tasks are numbered here and have no table
+    // slot.
+    uint64_t graph_storage_count;
+    uint64_t callable_addresses_address;
+    uint64_t callable_addresses_count;
+    // One DispatchPayload per lane. A lane fills its own payload and then runs
+    // it, so there is never a second one in flight.
+    uint64_t dispatch_payloads_offset;
+    // Prefilled by the host so a lane can bound its startup wait; the AICPU
+    // overwrites it with any override when it publishes the topology.
+    uint64_t scheduler_timeout_cycles;
+    // Pads the progress counter below onto its own 64 B line.
+    uint8_t reserved[320 - 33 * sizeof(uint64_t)];
+
+    // **Alone on the last line.** Lanes batch their completions into this, and
+    // the AICPU supervisor polls it against `executable_task_count`. It is the
+    // block's only writer during a run, so any field sharing its line would make
+    // every reader of that field queue behind its atomics: `lane_error` read
+    // beside it cost 919 cycles a task on paged_attention Case1, against 94
+    // uncontended.
+    //
+    // Not volatile, and nothing in this struct is: a wire struct has to stay
+    // trivially copyable. Cross-core visibility uses the runtime's explicit
+    // discipline -- an atomic add to write, ld_dev or an invalidate to read.
+    alignas(64) uint64_t resolved_task_count;
+    uint8_t resolved_reserved[56];
+};
+static_assert(sizeof(PercounterControl) == 384, "percounter control is three 128 B lines");
+static_assert(
+    offsetof(PercounterControl, resolved_task_count) % 64 == 0,
+    "the one field lanes write must start a cache line, or every reader of its neighbours pays for it"
+);
+static_assert(
+    offsetof(PercounterControl, lane_error) / 64 != offsetof(PercounterControl, resolved_task_count) / 64,
+    "lane_error is read every task; it must not share a line with the counter lanes increment"
+);
+static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
+
+/**
+ * How many consecutive order-list positions one ticket draw hands out.
+ *
+ * With one position per draw the ticket bounds any graph whose tasks are shorter
+ * than the draw cost times the lane count: `mixed_multi_root_4096` (4096 tasks,
+ * no edges) spent 355 of its 844 us on the ticket. A range divides the draws by
+ * `BATCH` and keeps the queue work-conserving -- nothing is bound to a lane
+ * before it asks.
+ *
+ * What a range costs is availability: a lane is committed to its positions, so
+ * one holding `BATCH` blocked positions cannot hand them to an idle lane. The
+ * two costs move against each other and no value wins everywhere; 4 is chosen on
+ * the worst case against each shape's own best (B=1 3.11x off, B=2 1.76x, B=4
+ * 1.39x, B=8 1.96x across the mixed_* DAGs and paged_attention Case1 on a5).
+ */
+inline constexpr uint64_t PERCOUNTER_CLAIM_BATCH = 4;
+
+// A kernel at least this long (3 us) makes a lane draw one position at a time. A
+// draw plus its readiness check is about 1 us, so above a few of those a range
+// saves a small share of each task while risking a whole kernel per position it
+// withholds. Measured on a5: qwen3 decode 29.60 -> 23.02 ms device wall, with no
+// change on the mixed_* DAGs or paged_attention Case1, whose ~2 us kernels stay
+// below it.
+inline constexpr uint64_t PERCOUNTER_LONG_KERNEL_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1000000 * 3;
+
+/**
+ * Turn a ticket draw into the half-open range of order-list positions it owns.
+ * Returns false when the draw starts at or past the end of the list.
+ *
+ *  - **Disjoint and ascending.** Each draw of `scheduler_gm_fetch_add(ticket,
+ *    BATCH)` gets a distinct base `BATCH` apart, so the ranges tile the list in
+ *    order. A gap would strand a task -- a lane spinning on a counter nobody
+ *    sets -- and an overlap would run one twice.
+ *  - **Deadlock-free.** Every list is ordered by descending (b-level, -id), a
+ *    key global across the lists (see build_tables). Take the incomplete task T
+ *    with the greatest key. Its producers have strictly greater b-levels and
+ *    everything before it in its own list has a greater key, so all of them are
+ *    complete; the draws reached T's position, and the lane holding it has
+ *    nothing left to wait for. The argument needs no topology, which is why a
+ *    lane knows neither its cluster nor the cluster count to claim.
+ *
+ * The clamp matters: the draw counter keeps rising past the end of the list, so
+ * the last real range straddles it and every later draw starts beyond it.
+ */
+inline __aicore__ bool
+percounter_claim_range(uint64_t base, uint64_t batch, uint64_t order_count, uint64_t *first, uint64_t *last_exclusive) {
+    if (first == nullptr || last_exclusive == nullptr || batch == 0) return false;
+    if (base >= order_count) return false;
+    *first = base;
+    // base < order_count holds, so this cannot wrap.
+    *last_exclusive = (order_count - base < batch) ? order_count : base + batch;
+    return true;
+}
+
+}  // namespace simpler::hbg::percounter
