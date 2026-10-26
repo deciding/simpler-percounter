@@ -104,6 +104,9 @@ struct LaneConfig {
     __gm__ PercounterCounter *counters;
     uint64_t task_count;
     uint64_t order_count;
+    // Whether any task carries a dispatch predicate; a graph without one never
+    // reads the predicate words.
+    bool has_predicates;
 
     // This lane's place in its cluster: lane 0 is the AIC, 1 and 2 the AIVs,
     // which is also the subtask slot it runs of a MIX task.
@@ -181,6 +184,11 @@ inline __aicore__ bool percounter_fanin_ready(const LaneConfig &cfg, int64_t tas
     return true;
 }
 
+inline __aicore__ void percounter_fail(const LaneConfig &cfg, SchedulerGraphResult result) {
+    // First error wins.
+    scheduler_gm_compare_exchange(cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(result));
+}
+
 /** The task's kernel id per subtask slot; negative where the slot is unused. */
 inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const LaneConfig &cfg, int64_t task_id) {
     return reinterpret_cast<__gm__ int32_t *>(
@@ -197,12 +205,28 @@ inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const LaneConfig &cfg, i
  * earlier task would survive another core rewriting it. The legacy executor
  * invalidates the same way on every dispatch.
  *
- * Returns false when the callable or the payload cannot be resolved.
+ * **A predicate decides whether the kernel runs, not whether the task
+ * completes.** A false one returns as a task with no kernel does, and the caller
+ * publishes either way, so consumers are released all the same. Its operand's
+ * producer is in the task's fanin, which has published, so the value is final.
+ *
+ * Returns false when the predicate is malformed, or when the callable or the
+ * payload cannot be resolved.
  */
 inline __aicore__ bool percounter_launch_kernel(
     const LaneConfig &cfg, int64_t task_id, int32_t subtask_slot, int32_t kernel_id, int32_t block_idx,
     int32_t block_num, uint64_t *kernel_start
 ) {
+    if (cfg.has_predicates) {
+        const SchedulerPredicateResult verdict = scheduler_evaluate_task_predicate(cfg.graph, task_id);
+        if (verdict == SchedulerPredicateResult::MALFORMED) {
+            // First error wins, so the caller's INVALID_CALLABLE does not replace it.
+            percounter_fail(cfg, SchedulerGraphResult::INVALID_ARGUMENTS);
+            return false;
+        }
+        if (verdict == SchedulerPredicateResult::FAIL) return true;
+    }
+
     uint64_t function_address = 0;
     if (!scheduler_lookup_callable_address(
             cfg.callable_addresses, cfg.callable_count, static_cast<uint16_t>(kernel_id), &function_address
@@ -263,11 +287,6 @@ inline __aicore__ bool percounter_run_subtask(
 /** Record `count` finished subtasks of `task_id`; called after their store barriers. */
 inline __aicore__ void percounter_publish_completion(const LaneConfig &cfg, int64_t task_id, uint64_t count) {
     scheduler_gm_fetch_add(cfg.counters[task_id].value, count);
-}
-
-inline __aicore__ void percounter_fail(const LaneConfig &cfg, SchedulerGraphResult result) {
-    // First error wins.
-    scheduler_gm_compare_exchange(cfg.control->lane_error, uint64_t{0}, static_cast<uint64_t>(result));
 }
 
 /** True when the lane should stop: EXIT is signalled or some lane has failed. */
@@ -803,6 +822,7 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.counters = scheduler_state_at<PercounterCounter>(control, scheduler_gm_query(control->counters_offset));
     cfg.task_count = scheduler_gm_query(control->task_count);
     cfg.order_count = scheduler_gm_query(control->order_count[type_index]);
+    cfg.has_predicates = scheduler_gm_query(control->has_predicates) != 0;
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
 

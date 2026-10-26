@@ -86,11 +86,12 @@ enum class StateSelection : uint8_t {
 /**
  * Take the graph for percounter when it was requested and every task has a
  * shape percounter runs: one active subtask (AIC, or AIV0) or a MIX task of
- * two or three, any block count, no sync start and no dispatch predicate.
+ * two or three, any block count, and no sync start.
  *
  * `task_metadata` and `inline_completed_task_ids` are the default selection's
- * per-task walk, which has already rejected any malformed task and checked
- * every kernel id against the callable table.
+ * per-task walk, which has already rejected any malformed task, checked every
+ * kernel id against the callable table, and refused a dispatch predicate on any
+ * task other than a single-subtask, single-block one.
  */
 inline StateSelection select_percounter_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
@@ -120,10 +121,7 @@ inline StateSelection select_percounter_state(
                 log_fallback(total_tasks, "a sync-start task", task_id);
                 return StateSelection::DEFAULT;
             }
-            if (slot.task_attrs.has_predicate()) {
-                log_fallback(total_tasks, "a predicated task", task_id);
-                return StateSelection::DEFAULT;
-            }
+            input.has_predicate = slot.task_attrs.has_predicate();
             const uint8_t active_mask = task_metadata[t].active_mask;
             const TaskPlacement placement = task_placement_from_active_mask(active_mask, &input.core_type_index);
             if (placement == TaskPlacement::UNSUPPORTED) {
