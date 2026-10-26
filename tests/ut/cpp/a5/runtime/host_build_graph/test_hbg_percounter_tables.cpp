@@ -477,7 +477,6 @@ TEST(PercounterTables, ASyncStartTaskTakesOneArmingEntryRatherThanOnePerBlock) {
     EXPECT_EQ(queue->open_generation, 0u);
     EXPECT_EQ(queue->open_task_id, -1);
     EXPECT_EQ(queue->released, 0u);
-    EXPECT_EQ(queue->head, 0u);
     EXPECT_EQ(queue->tail, 0u);
 
     // **Both regions have to reach the control block, and a zero offset is not
@@ -491,9 +490,13 @@ TEST(PercounterTables, ASyncStartTaskTakesOneArmingEntryRatherThanOnePerBlock) {
     EXPECT_EQ(control->sync_cohort_offset, layout.sync_cohort_offset);
     EXPECT_EQ(control->sync_pending_offset, layout.sync_pending_offset);
 
-    // The ring holds one descriptor per sync-start task, so a sequence number
-    // can never wrap and an enqueue can never find it full.
-    EXPECT_GE(layout.total_size, layout.sync_pending_offset + layout.sync_cohort_count * sizeof(uint64_t));
+    // The ring holds one descriptor and one claim count per sync-start task, so
+    // a sequence number can never wrap, an enqueue can never find it full, and
+    // no two cohorts share a claim count. Every count starts at zero.
+    EXPECT_GE(layout.total_size, layout.sync_pending_offset + 2 * layout.sync_cohort_count * sizeof(uint64_t));
+    const auto *ring = pc::region_at<uint64_t>(region.base(), layout.sync_pending_offset);
+    for (uint64_t seq = 0; seq < layout.sync_cohort_count; ++seq)
+        EXPECT_EQ(ring[layout.sync_cohort_count + seq], 0u);
 }
 
 // A sync-start MIX task is placed by its mask like every other task, so its

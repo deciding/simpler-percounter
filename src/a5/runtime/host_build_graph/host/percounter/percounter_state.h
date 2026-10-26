@@ -86,7 +86,7 @@ enum class StateSelection : uint8_t {
 /**
  * Take the graph for percounter when it was requested and every task has a
  * shape percounter runs: one active subtask (AIC, or AIV0) or a MIX task of
- * two or three, any block count, and no sync start.
+ * two or three, any block count, with or without sync start.
  *
  * `task_metadata` and `inline_completed_task_ids` are the default selection's
  * per-task walk, which has already rejected any malformed task, checked every
@@ -110,6 +110,7 @@ inline StateSelection select_percounter_state(
     std::vector<size_t> edge_begin(task_count, 0);
     uint64_t order_count[PERCOUNTER_CORE_TYPE_COUNT] = {0, 0};
     uint64_t mix_order_count = 0;
+    uint64_t sync_cohort_count = 0;
     uint64_t block_total = 0;
     for (size_t t = 0; t < task_count; ++t) {
         const int64_t task_id = static_cast<int64_t>(t);
@@ -117,10 +118,7 @@ inline StateSelection select_percounter_state(
         TaskInput &input = inputs[t];
         input.inline_completed = inline_completed[t];
         if (!input.inline_completed) {
-            if (slot.task_attrs.requires_sync_start()) {
-                log_fallback(total_tasks, "a sync-start task", task_id);
-                return StateSelection::DEFAULT;
-            }
+            input.sync_start = slot.task_attrs.requires_sync_start();
             input.has_predicate = slot.task_attrs.has_predicate();
             const uint8_t active_mask = task_metadata[t].active_mask;
             const TaskPlacement placement = task_placement_from_active_mask(active_mask, &input.core_type_index);
@@ -131,8 +129,12 @@ inline StateSelection select_percounter_state(
             input.block_num = slot.logical_block_num;
             input.is_mix = placement == TaskPlacement::MIX;
             input.subtask_count = __builtin_popcount(active_mask);
-            if (input.is_mix) mix_order_count += static_cast<uint64_t>(input.block_num);
-            else order_count[input.core_type_index] += static_cast<uint64_t>(input.block_num);
+            // A sync-start task holds one arming entry; its blocks are handed
+            // out from the cohort queue instead of from a list.
+            const uint64_t entries = input.sync_start ? 1 : static_cast<uint64_t>(input.block_num);
+            if (input.sync_start) ++sync_cohort_count;
+            if (input.is_mix) mix_order_count += entries;
+            else order_count[input.core_type_index] += entries;
             block_total += static_cast<uint64_t>(input.block_num);
         } else {
             ++block_total;
@@ -147,7 +149,7 @@ inline StateSelection select_percounter_state(
         inputs[t].fanin_ids = inputs[t].fanin_count > 0 ? edges.data() + edge_begin[t] : nullptr;
 
     PercounterLayout layout{};
-    if (!plan_layout(task_count, block_total, edges.size(), order_count, &layout, mix_order_count)) {
+    if (!plan_layout(task_count, block_total, edges.size(), order_count, &layout, mix_order_count, sync_cohort_count)) {
         LOG_ERROR("A5 HBG percounter: state layout overflow");
         return StateSelection::FAILED;
     }
@@ -198,8 +200,8 @@ inline StateSelection select_percounter_state(
     );
     LOG_INFO(
         "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
-        " MIX blocks, %zu edges)",
-        total_tasks, order_count[0], order_count[1], mix_order_count, edges.size()
+        " MIX list entries, %" PRIu64 " sync cohorts, %zu edges)",
+        total_tasks, order_count[0], order_count[1], mix_order_count, sync_cohort_count, edges.size()
     );
     return StateSelection::PERCOUNTER;
 }

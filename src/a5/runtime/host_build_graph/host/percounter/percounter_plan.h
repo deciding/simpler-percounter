@@ -54,8 +54,9 @@ struct PercounterLayout {
     uint64_t mix_order_offset;
     uint64_t mix_ticket_offset;
     uint64_t mix_signal_ready_offset;
-    // The sync-start queue and its ring, reserved only when the graph has a
-    // sync-start task. The count is the number of such tasks.
+    // The sync-start queue and its ring (descriptors, then per-cohort claim
+    // counts), reserved only when the graph has a sync-start task. The count
+    // is the number of such tasks.
     uint64_t sync_cohort_count;
     uint64_t sync_cohort_offset;
     uint64_t sync_pending_offset;
@@ -139,7 +140,7 @@ inline bool plan_layout(
           !PERCOUNTER_RESERVE(PERCOUNTER_MIX_TICKET_COUNT, PercounterTicket, mix_ticket_offset) ||
           !PERCOUNTER_RESERVE(SCHEDULER_CLUSTER_CAPACITY, uint64_t, mix_signal_ready_offset))) ||
         (sync_cohort_count != 0 && (!PERCOUNTER_RESERVE(1, PercounterSyncQueue, sync_cohort_offset) ||
-                                    !PERCOUNTER_RESERVE(sync_cohort_count, uint64_t, sync_pending_offset))) ||
+                                    !PERCOUNTER_RESERVE(2 * sync_cohort_count, uint64_t, sync_pending_offset))) ||
         (shell_count != 0 && (!PERCOUNTER_RESERVE(shell_count, PercounterShell, shells_offset) ||
                               !PERCOUNTER_RESERVE(task_count, uint64_t, storage_addresses_offset))) ||
         !PERCOUNTER_RESERVE(task_count, PercounterFanin, fanin_offset) ||

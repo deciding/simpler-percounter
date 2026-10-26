@@ -222,20 +222,21 @@ struct alignas(64) PercounterSyncQueue {
     uint64_t open_seq;  // this cohort's position in the promotion order
     uint64_t open_armed_cycles;
     uint8_t reserved0[24];
-    // Claims against the open cohort, the generation in the upper half so a
-    // stale read cannot consume a block of the cohort that replaced it.
-    alignas(64) uint64_t arrived;
-    uint8_t reserved1[56];
+    // Claims are not counted here but per cohort, in the second half of the
+    // descriptor ring (see `percounter_sync_claims`): a claim that lands after
+    // its cohort was replaced must not consume a block of the replacement.
+    alignas(64) uint8_t reserved1[64];
     // Promotion order: a cohort of sequence `s` has been fully claimed once this
     // exceeds `s`. Monotone and never reused.
     alignas(64) uint64_t released;
     uint8_t reserved2[56];
-    // Ring cursors: `tail` hands out sequence numbers, `head` is the next to
-    // promote. Both monotone; the ring is sized to the graph's cohort count, so
-    // neither wraps.
+    // Hands out sequence numbers; monotone, and the ring is sized to the
+    // graph's cohort count, so it never wraps. The next sequence to promote is
+    // `open_generation / 2`, not a cursor of its own: every cohort adds exactly
+    // two to the generation, and reading both from the word the promotion CAS
+    // checks is what keeps a stale cursor from promoting one cohort twice.
     alignas(64) uint64_t tail;
-    uint64_t head;
-    uint8_t reserved3[48];
+    uint8_t reserved3[56];
     // Cohort blocks that have actually *run*, which the exit rule waits on.
     // `released` says only that every block has an owner. A MIX cohort block is
     // not even run by the lane that claimed it -- the claimer arms its cluster
@@ -245,10 +246,22 @@ struct alignas(64) PercounterSyncQueue {
     uint8_t reserved4[56];
 };
 static_assert(sizeof(PercounterSyncQueue) == 320, "the sync queue owns five isolated cache lines");
-static_assert(
-    offsetof(PercounterSyncQueue, arrived) / 64 != offsetof(PercounterSyncQueue, released) / 64,
-    "arrived is hammered once per block while released is polled by every holder"
-);
+
+/**
+ * The descriptor ring holds `2 * cohort_count` words: the descriptors at
+ * `[0, cohort_count)` and each cohort's claim count at `cohort_count + seq`.
+ *
+ * **A claim count belongs to one cohort for the whole run.** A shared count
+ * reset at each promotion let a lane that read "one block left" add after the
+ * last block was taken, the cohort released and the next one promoted -- its
+ * add then consumed a block index of the next cohort that nobody would run, and
+ * that cohort never filled. With 2-block cohorts and idle lanes that window is
+ * routine. A late add to a count of its own lands past the block count and is
+ * discarded.
+ */
+inline __aicore__ __gm__ uint64_t *percounter_sync_claims(__gm__ uint64_t *ring, uint64_t cohort_count, uint64_t seq) {
+    return ring + cohort_count + seq;
+}
 static_assert(std::is_trivially_copyable_v<PercounterSyncQueue> && std::is_standard_layout_v<PercounterSyncQueue>);
 
 /** Whether a cohort is currently open for claims. Same parity rule as MIX. */

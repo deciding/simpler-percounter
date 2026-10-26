@@ -120,6 +120,32 @@ struct LaneConfig {
     __gm__ PercounterTicket *mix_tickets;
     __gm__ uint64_t *mix_signal_ready;
     SCHEDULER_SSBUF PercounterMixSignal *mix_signal;
+    // The sync-start cohort queue. `sync_cohort_count == 0` means the graph has
+    // no sync-start task, and the two pointers are then null.
+    uint64_t sync_cohort_count;
+    uint64_t sync_block_total;
+    __gm__ PercounterSyncQueue *sync_queue;
+    __gm__ uint64_t *sync_pending;
+};
+
+/**
+ * What this lane knows about the cohort queue.
+ *
+ * `my_block < 0` is both "holds nothing" and "nothing to serve", the common
+ * state. The payload is copied when the block is taken, because the open slot
+ * it came from is recycled the moment the cohort is fully claimed.
+ */
+struct PercounterSyncState {
+    // The open cohort this lane has already decided about. The open slot's
+    // generation rises by two per cohort, so it names each one, and checking it
+    // costs no load beyond the generation itself.
+    uint64_t decided_generation;
+    uint64_t my_seq;
+    int32_t my_block;
+    int64_t task_id;
+    uint32_t block_num;
+    uint32_t active_mask;
+    uint64_t taken_cycles;
 };
 
 /**
@@ -144,6 +170,7 @@ struct PercounterLaneState {
     // The last MIX generation this lane has looked at, served or not.
     uint32_t last_served;
     PercounterMixClaim claim;
+    PercounterSyncState sync;
 };
 
 /** Where a task's producer counters are: `addresses[0 .. count)`. */
@@ -368,6 +395,211 @@ inline __aicore__ void percounter_mix_release(const LaneConfig &cfg) {
 }
 
 /**
+ * Sync-start cohorts: a task whose `block_num` blocks must all start together.
+ *
+ * Such a task holds one arming entry in its list instead of one per block. The
+ * lane that runs the entry queues the task; the queue promotes cohorts one at a
+ * time into its open slot, and free lanes of the right kind each take one block
+ * of the open cohort with a fetch_add. The lane that takes the last block marks
+ * the cohort released and promotes the next one, and every holder of a block of
+ * a released cohort runs it.
+ *
+ * **A lane serves a released block before it looks at anything else.** A holder
+ * that joined another rendezvous first -- one that needs a lane already inside
+ * this cohort's kernel, waiting for this block -- would never come back. Every
+ * checkpoint therefore asks `percounter_sync_serve_released` before MIX
+ * discovery. Taking a block never blocks, and a holder never takes a second.
+ */
+inline constexpr uint32_t PERCOUNTER_SYNC_CHECK_INTERVAL = 8;
+
+/**
+ * Whether this lane is in the pool that serves a cohort of this shape. A MIX
+ * cohort is served by claimers alone: the claimer arms its own cluster's
+ * rendezvous rather than running the block, so one block is one commitment.
+ */
+inline __aicore__ bool percounter_sync_can_serve(const LaneConfig &cfg, uint32_t active_mask) {
+    if ((active_mask & (active_mask - 1U)) != 0) return cfg.cluster_lane == PERCOUNTER_MIX_CLAIMER_LANE;
+    if (active_mask == 1U) return cfg.cluster_lane == 0;
+    return cfg.cluster_lane != 0;
+}
+
+/**
+ * Move the next queued cohort into the open slot, if the slot is free.
+ *
+ * Only an enqueuer and a releaser call this; a general poll would put the
+ * whole pool on one compare-exchange. `open_task_id` is written last and is
+ * the only field a reader gates on.
+ *
+ * **The sequence to promote is derived from the generation the CAS checks.**
+ * With a separate cursor, a lane could read it, then lose the time in which
+ * another lane promoted that cohort and it filled and was released -- and its
+ * CAS on the now-free slot would promote the same cohort a second time.
+ */
+inline __aicore__ void percounter_sync_promote(const LaneConfig &cfg) {
+    __gm__ PercounterSyncQueue *q = cfg.sync_queue;
+    const uint64_t generation = scheduler_gm_query(q->open_generation);
+    if (percounter_sync_armed(generation)) return;
+    const uint64_t seq = generation / 2;
+    if (seq >= scheduler_gm_query(q->tail)) return;
+    const uint64_t desc = scheduler_gm_query(cfg.sync_pending[seq]);
+    // Reserved but not yet written: its own enqueuer will promote it.
+    if (desc == 0) return;
+    if (scheduler_gm_compare_exchange(q->open_generation, generation, generation + 1) != generation) return;
+
+    scheduler_gm_store(q->open_block_num, percounter_sync_desc_blocks(desc));
+    scheduler_gm_store(q->open_active_mask, percounter_sync_desc_mask(desc));
+    scheduler_gm_store(q->open_seq, seq);
+    scheduler_gm_store(q->open_task_id, percounter_sync_desc_task(desc));
+}
+
+/**
+ * Queue `task_id` for gathering. Never fails and is never retried: the
+ * sequence number is taken first, and the trailing promote covers the slot
+ * falling free between this lane's two steps.
+ */
+inline __aicore__ void percounter_sync_enqueue(const LaneConfig &cfg, int64_t task_id, int32_t block_num) {
+    const uint32_t mask = percounter_mix_active_mask(cfg, task_id);
+    const uint64_t seq = scheduler_gm_fetch_add(cfg.sync_queue->tail, uint64_t{1});
+    scheduler_gm_store(cfg.sync_pending[seq], percounter_sync_desc(task_id, static_cast<uint32_t>(block_num), mask));
+    percounter_sync_promote(cfg);
+}
+
+/**
+ * Take a block of cohort `seq`, or -1 if none is left.
+ *
+ * One fetch_add on that cohort's own claim count, never a retry loop: a
+ * compare-exchange loop measured 6-11 attempts per take with the whole pool on
+ * one line. An index past the end is discarded, and every real index still
+ * went to exactly one lane, however late the add.
+ */
+inline __aicore__ int32_t percounter_sync_take_block(const LaneConfig &cfg, uint64_t seq, uint32_t block_num) {
+    __gm__ uint64_t *claims = percounter_sync_claims(cfg.sync_pending, cfg.sync_cohort_count, seq);
+    if (scheduler_gm_query(*claims) >= block_num) return -1;
+    const uint64_t prev = scheduler_gm_fetch_add(*claims, uint64_t{1});
+    return prev < block_num ? static_cast<int32_t>(prev) : -1;
+}
+
+/**
+ * Run the block this lane holds, now that its cohort is released.
+ *
+ * A MIX cohort block arms this lane's own cluster instead, with `cohort_block`
+ * set so the rendezvous reports to the queue rather than to the MIX list. The
+ * line is acquired by polling: an armed line frees in bounded time, since every
+ * participant it names is already gathering. `my_block` stays set until the
+ * block is run or armed.
+ */
+inline __aicore__ bool percounter_sync_serve_block(const LaneConfig &cfg, PercounterLaneState *state) {
+    PercounterSyncState *sync = &state->sync;
+    if ((sync->active_mask & (sync->active_mask - 1U)) == 0) {
+        uint64_t kernel_start = 0;
+        if (!percounter_run_task(
+                cfg, sync->task_id, sync->my_block, static_cast<int32_t>(sync->block_num), &kernel_start
+            )) {
+            percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
+            return false;
+        }
+        percounter_publish_completion(cfg, sync->task_id, uint64_t{1});
+        ++state->local_done;
+        sync->my_block = -1;
+        scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
+        return true;
+    }
+
+    SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
+    const uint32_t generation = scheduler_ssbuf_load_acquire(&signal->armed_generation);
+    if (percounter_mix_armed(generation)) return true;
+    signal->task_id = sync->task_id;
+    signal->active_mask = sync->active_mask;
+    signal->block_idx = sync->my_block;
+    signal->block_num = static_cast<int32_t>(sync->block_num);
+    signal->cohort_block = 1;
+    scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
+    sync->my_block = -1;
+    return true;
+}
+
+/**
+ * Serve the block this lane holds if its cohort has been released; `served`
+ * reports whether a block was run or armed. Checked at every checkpoint, ahead
+ * of MIX discovery, and costs one load only while a block is held.
+ *
+ * Returns false on an error, including a cohort that has not filled within the
+ * watchdog since this lane took its block.
+ */
+inline __aicore__ bool percounter_sync_serve_released(
+    const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served
+) {
+    *served = false;
+    PercounterSyncState *sync = &state->sync;
+    if (sync->my_block < 0) return true;
+    // Cohorts are promoted in sequence order, so this one is fully claimed
+    // exactly when the counter passes it.
+    if (scheduler_gm_query(cfg.sync_queue->released) > sync->my_seq) {
+        const bool ok = percounter_sync_serve_block(cfg, state);
+        *served = sync->my_block < 0;
+        return ok;
+    }
+    if (scheduler_watchdog_expired(sync->taken_cycles, get_sys_cnt_aicore(), timeout_cycles)) {
+        percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
+        return false;
+    }
+    return true;
+}
+
+/**
+ * Take a block of the open cohort if this lane holds none and has not yet
+ * decided about it. Taking the last block releases the cohort, promotes the
+ * next one, and serves at once.
+ *
+ * Never blocks: the lane goes back to its own list holding no order position,
+ * which keeps cohorts out of the claim range's deadlock argument.
+ */
+inline __aicore__ bool
+percounter_sync_take(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served) {
+    *served = false;
+    PercounterSyncState *sync = &state->sync;
+    if (cfg.sync_cohort_count == 0 || sync->my_block >= 0) return true;
+    const uint64_t generation = scheduler_gm_query(cfg.sync_queue->open_generation);
+    // Before any further load: a lane that has decided reaches here at every
+    // checkpoint while the cohort is open, and reading the payload first cost
+    // 40% of `sparse_256_b24`.
+    if (!percounter_sync_armed(generation) || sync->decided_generation == generation) return true;
+    const int64_t task_id = scheduler_gm_query(cfg.sync_queue->open_task_id);
+    // Slot taken, payload not yet published: deciding now would read the
+    // previous cohort's shape, and a decision is final.
+    if (task_id < 0) return true;
+    if (task_id >= static_cast<int64_t>(cfg.task_count)) {
+        percounter_fail(cfg, SchedulerGraphResult::INVALID_TASK_ID);
+        return false;
+    }
+    const uint64_t seq = scheduler_gm_query(cfg.sync_queue->open_seq);
+    const uint64_t shape = scheduler_gm_query_u32_pair(&cfg.sync_queue->open_block_num);
+    // A seqlock: the slot may have been released and refilled between these
+    // loads, and the task, sequence and shape must all be one cohort's.
+    if (scheduler_gm_query(cfg.sync_queue->open_generation) != generation) return true;
+    sync->decided_generation = generation;
+    sync->task_id = task_id;
+    sync->block_num = static_cast<uint32_t>(shape & 0xffffffffULL);
+    sync->active_mask = static_cast<uint32_t>(shape >> 32);
+    if (!percounter_sync_can_serve(cfg, sync->active_mask)) return true;
+    const int32_t block = percounter_sync_take_block(cfg, seq, sync->block_num);
+    if (block < 0) return true;
+    sync->my_block = block;
+    sync->my_seq = seq;
+    sync->taken_cycles = get_sys_cnt_aicore();
+    if (static_cast<uint32_t>(block) + 1 < sync->block_num) return true;
+
+    // The last block. `released` goes out before the slot is freed: it is what
+    // the other holders wait on, and the slot is about to belong to another.
+    __gm__ PercounterSyncQueue *q = cfg.sync_queue;
+    scheduler_gm_store(q->open_task_id, int64_t{-1});
+    scheduler_gm_store(q->released, seq + 1);
+    scheduler_gm_store(q->open_generation, generation + 1);
+    percounter_sync_promote(cfg);
+    return percounter_sync_serve_released(cfg, state, timeout_cycles, served);
+}
+
+/**
  * Draw the next MIX position for this cluster, and announce the one it holds
  * once that task is runnable.
  *
@@ -409,12 +641,23 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
     }
     if (!percounter_fanin_ready(cfg, claim->task_id)) return;
 
+    // A sync-start MIX task's single arming entry queues the cohort instead of
+    // arming this cluster; its blocks are handed out from the queue.
+    if (claim->block_idx == PERCOUNTER_ORDER_BLOCK_IDX_ARM) {
+        percounter_sync_enqueue(cfg, claim->task_id, claim->block_num);
+        claim->task_id = -1;
+        return;
+    }
+
     // The payload before the generation, and the generation with release
     // ordering: a lane that observes an odd generation observes its payload.
     signal->task_id = claim->task_id;
     signal->active_mask = percounter_mix_active_mask(cfg, claim->task_id);
     signal->block_idx = claim->block_idx;
     signal->block_num = claim->block_num;
+    // Every arming: the previous rendezvous on this line may have been a
+    // cohort block.
+    signal->cohort_block = 0;
     scheduler_ssbuf_store_release(&signal->armed_generation, generation + 1);
     claim->task_id = -1;
 }
@@ -428,11 +671,16 @@ inline __aicore__ void percounter_mix_arm(const LaneConfig &cfg, PercounterMixCl
  * producer could neither free its line nor announce the next MIX task, and once
  * enough clusters waited on producers that were themselves MIX tasks nothing
  * could advance the MIX list.
+ *
+ * A claimer holding a cohort block still releases but does not announce: once
+ * its cohort is released, peers that started first wait at the kernel's
+ * barrier for this block, and a claimer preferring its own MIX list would hold
+ * them there.
  */
-inline __aicore__ void percounter_mix_tick(const LaneConfig &cfg, PercounterMixClaim *claim) {
+inline __aicore__ void percounter_mix_tick(const LaneConfig &cfg, PercounterLaneState *state) {
     if (cfg.mix_order_count == 0 || cfg.cluster_lane != PERCOUNTER_MIX_CLAIMER_LANE) return;
     percounter_mix_release(cfg);
-    percounter_mix_arm(cfg, claim);
+    if (state->sync.my_block < 0) percounter_mix_arm(cfg, &state->claim);
 }
 
 /**
@@ -443,10 +691,18 @@ inline __aicore__ void percounter_mix_tick(const LaneConfig &cfg, PercounterMixC
  * is the count of MIX rendezvous that have **completed**, not of positions
  * drawn: drawing and announcing are two steps, and a lane reading "list spent,
  * my line free" between them would leave while its claimer is about to name it.
+ *
+ * Cohorts follow the same rule: every cohort block must have run, not merely
+ * have an owner, since a MIX cohort block is run by its cluster's rendezvous
+ * rather than by the lane that took it. And a lane that owes a block never
+ * leaves: the cohort is released the instant its last block is taken.
  */
-inline __aicore__ bool percounter_lane_may_exit(const LaneConfig &cfg) {
-    return cfg.mix_order_count == 0 ||
-           scheduler_gm_query(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next) >= cfg.mix_rendezvous_count;
+inline __aicore__ bool percounter_lane_may_exit(const LaneConfig &cfg, const PercounterLaneState *state) {
+    if (state->sync.my_block >= 0) return false;
+    if (cfg.mix_order_count != 0 &&
+        scheduler_gm_query(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next) < cfg.mix_rendezvous_count)
+        return false;
+    return cfg.sync_cohort_count == 0 || scheduler_gm_query(cfg.sync_queue->completed) >= cfg.sync_block_total;
 }
 
 /**
@@ -495,11 +751,13 @@ inline __aicore__ bool percounter_mix_wait(
  * monotone. The readiness check below is therefore an assertion.
  *
  * The lowest participant publishes the whole rendezvous; every lane computes
- * the same lowest from the same mask, so this needs no election.
+ * the same lowest from the same mask, so this needs no election. It reports a
+ * cohort block to the cohort queue and any other block to the MIX list it was
+ * drawn from.
  */
 inline __aicore__ bool percounter_serve_mix(
     const LaneConfig &cfg, uint32_t generation, int64_t task_id, uint32_t mask, int32_t block_idx, int32_t block_num,
-    PercounterLaneState *state, uint64_t timeout_cycles
+    bool cohort_block, PercounterLaneState *state, uint64_t timeout_cycles
 ) {
     SCHEDULER_SSBUF PercounterMixSignal *signal = cfg.mix_signal;
     const uint32_t lane = static_cast<uint32_t>(cfg.cluster_lane);
@@ -530,9 +788,10 @@ inline __aicore__ bool percounter_serve_mix(
         // The counter was preset against the task's whole subtask total, so
         // this add carries the block's share of it at once.
         percounter_publish_completion(cfg, task_id, static_cast<uint64_t>(__builtin_popcount(mask)));
-        // After the task counter: a lane that sees this count reach its total
+        // After the task counter: a lane that sees either count reach its total
         // may stop, and no consumer of the task may still be waiting then.
-        scheduler_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next, uint64_t{1});
+        if (cohort_block) scheduler_gm_fetch_add(cfg.sync_queue->completed, uint64_t{1});
+        else scheduler_gm_fetch_add(cfg.mix_tickets[PERCOUNTER_MIX_TICKET_DONE].next, uint64_t{1});
         ++state->local_done;
     }
     return true;
@@ -559,12 +818,27 @@ percounter_mix_discover(const LaneConfig &cfg, PercounterLaneState *state, uint6
     const uint32_t mask = signal->active_mask;
     const int32_t block_idx = signal->block_idx;
     const int32_t block_num = signal->block_num;
+    const bool cohort_block = signal->cohort_block != 0;
     if (scheduler_ssbuf_load_acquire(&signal->armed_generation) != generation) return true;
 
     state->last_served = generation;
     if ((mask & (uint32_t{1} << cfg.cluster_lane)) == 0) return true;
     *served = true;
-    return percounter_serve_mix(cfg, generation, task_id, mask, block_idx, block_num, state, timeout_cycles);
+    return percounter_serve_mix(
+        cfg, generation, task_id, mask, block_idx, block_num, cohort_block, state, timeout_cycles
+    );
+}
+
+/**
+ * One checkpoint's service of work other lanes may be waiting on: a released
+ * cohort block first, then the cluster's MIX line. `served` reports whether
+ * this lane ran or armed anything.
+ */
+inline __aicore__ bool
+percounter_checkpoint_serve(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, bool *served) {
+    if (!percounter_sync_serve_released(cfg, state, timeout_cycles, served)) return false;
+    if (*served) return true;
+    return percounter_mix_discover(cfg, state, timeout_cycles, served);
 }
 
 /** Fold this lane's finished blocks into the shared progress count. */
@@ -576,24 +850,27 @@ inline __aicore__ void percounter_flush_done(const LaneConfig &cfg, PercounterLa
 
 /**
  * Stay reachable after this lane's own list is spent, until every MIX
- * rendezvous is over, serving and -- on the claimer -- drawing as before.
+ * rendezvous and every cohort block is over, serving, taking cohort blocks
+ * and -- on the claimer -- drawing as before.
  *
- * The SSBUF line is this cluster's alone, so it is read every iteration. The GM
- * words are read by every drained lane on the device, so they are polled once
- * per `PERCOUNTER_SPIN_CHECK_INTERVAL`: polling them every iteration held a
- * drained lane to ~1800 cycles a pass on `multi_root_1024`, which starved the
- * claimer and serialised 342 MIX tasks that could have run 32 at a time.
+ * The SSBUF line is this cluster's alone, so it is read every iteration. The
+ * shared GM words are read by every drained lane on the device, so they are
+ * polled once per `PERCOUNTER_SPIN_CHECK_INTERVAL`: polling them every
+ * iteration held a drained lane to ~1800 cycles a pass on `multi_root_1024`,
+ * which starved the claimer and serialised 342 MIX tasks that could have run
+ * 32 at a time. The `released` word a holder polls is the exception, and only
+ * a lane holding a block reads it.
  */
 inline __aicore__ void
 percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles) {
-    if (cfg.mix_order_count == 0) return;
+    if (cfg.mix_order_count == 0 && cfg.sync_cohort_count == 0) return;
     // Restarted whenever the lane serves, so the watchdog measures idleness.
     uint64_t start = get_sys_cnt_aicore();
     uint32_t checks = 0;
     while (true) {
         bool served = false;
-        if (!percounter_mix_discover(cfg, state, timeout_cycles, &served)) return;
-        percounter_mix_tick(cfg, &state->claim);
+        if (!percounter_checkpoint_serve(cfg, state, timeout_cycles, &served)) return;
+        percounter_mix_tick(cfg, state);
         if (served) {
             start = get_sys_cnt_aicore();
             checks = 0;
@@ -601,7 +878,11 @@ percounter_mix_drain(const LaneConfig &cfg, PercounterLaneState *state, uint64_t
         if (++checks == PERCOUNTER_SPIN_CHECK_INTERVAL) {
             checks = 0;
             percounter_flush_done(cfg, state);
-            if (percounter_should_stop(cfg) || percounter_lane_may_exit(cfg)) return;
+            if (percounter_should_stop(cfg)) return;
+            bool took_served = false;
+            if (!percounter_sync_take(cfg, state, timeout_cycles, &took_served)) return;
+            if (took_served) start = get_sys_cnt_aicore();
+            if (percounter_lane_may_exit(cfg, state)) return;
             if (scheduler_watchdog_expired(start, get_sys_cnt_aicore(), timeout_cycles)) {
                 percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
                 return;
@@ -630,13 +911,23 @@ percounter_wait_for_fanin(const LaneConfig &cfg, int64_t task_id, PercounterLane
         const uint64_t address = scheduler_gm_query(view.addresses[i]);
         uint64_t start = get_sys_cnt_aicore();
         uint32_t checks = 0;
+        uint32_t sync_checks = 0;
         uint64_t misses = 0;
         while (!percounter_counter_published(percounter_observe(address))) {
             bool served = false;
-            if (!percounter_mix_discover(cfg, state, timeout_cycles, &served)) return false;
+            if (!percounter_checkpoint_serve(cfg, state, timeout_cycles, &served)) return false;
+            // A cohort fills only as fast as free lanes notice it, and a lane
+            // blocked here is often one that has not taken a block yet; at the
+            // 64-iteration interval with backoff it would look once per ~16k
+            // cycles. Eight keeps the shared read an eighth of every-iteration.
+            if (!served && cfg.sync_cohort_count != 0 && ++sync_checks >= PERCOUNTER_SYNC_CHECK_INTERVAL) {
+                sync_checks = 0;
+                if (!percounter_sync_take(cfg, state, timeout_cycles, &served)) return false;
+            }
             if (served) {
                 // The watchdog measures how late the producer is, and a
-                // rendezvous is time this lane spent running a task.
+                // rendezvous or a cohort block is time this lane spent
+                // running a task.
                 start = get_sys_cnt_aicore();
                 misses = 0;
                 checks = 0;
@@ -649,7 +940,7 @@ percounter_wait_for_fanin(const LaneConfig &cfg, int64_t task_id, PercounterLane
             if (++checks == PERCOUNTER_SPIN_CHECK_INTERVAL) {
                 checks = 0;
                 if (percounter_should_stop(cfg)) return false;
-                percounter_mix_tick(cfg, &state->claim);
+                percounter_mix_tick(cfg, state);
                 if (scheduler_watchdog_expired(start, get_sys_cnt_aicore(), timeout_cycles)) {
                     percounter_fail(cfg, SchedulerGraphResult::TIMEOUT);
                     return false;
@@ -691,7 +982,7 @@ percounter_wait_for_fanin(const LaneConfig &cfg, int64_t task_id, PercounterLane
  * or held by another lane, so it is the one the deadlock argument names.
  */
 inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t timeout_cycles) {
-    PercounterLaneState state{0, 0, PercounterMixClaim{-1, 0, 1, false}};
+    PercounterLaneState state{0, 0, PercounterMixClaim{-1, 0, 1, false}, PercounterSyncState{0, 0, -1, -1, 0, 0, 0}};
     uint64_t range_first = 0;
     uint32_t pending = 0;
     // A range withholds its positions from every other lane, which pays with
@@ -711,16 +1002,18 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
     while (true) {
         if (percounter_should_stop(cfg)) break;
         bool served = false;
-        if (!percounter_mix_discover(cfg, &state, timeout_cycles, &served)) break;
+        if (!percounter_checkpoint_serve(cfg, &state, timeout_cycles, &served)) break;
         if (served) continue;
-        percounter_mix_tick(cfg, &state.claim);
+        if (!percounter_sync_take(cfg, &state, timeout_cycles, &served)) break;
+        if (served) continue;
+        percounter_mix_tick(cfg, &state);
 
         if (pending == 0) {
             const uint64_t base = scheduler_gm_fetch_add(cfg.ticket->next, batch);
             uint64_t range_end = 0;
             // False means the list is spent: draws keep rising past its end, so
             // every lane arriving after the last task leaves here, through the
-            // MIX drain when the graph has MIX tasks.
+            // drain when the graph has MIX or sync-start tasks.
             if (!percounter_claim_range(base, batch, cfg.order_count, &range_first, &range_end)) {
                 percounter_flush_done(cfg, &state);
                 percounter_mix_drain(cfg, &state, timeout_cycles);
@@ -760,6 +1053,13 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         // task's producers to the end.
         if (!found && !percounter_wait_for_fanin(cfg, task_id, &state, timeout_cycles)) break;
         proven_task = task_id;
+
+        // A sync-start task's single entry queues the cohort once its fanin is
+        // ready. Its blocks are counted where they run, not here.
+        if (percounter_order_is_arming(entry)) {
+            percounter_sync_enqueue(cfg, task_id, percounter_order_block_num(entry));
+            continue;
+        }
 
         uint64_t kernel_start = 0;
         if (!percounter_run_task(
@@ -827,6 +1127,13 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.cluster_lane = coordinate.cluster_lane;
 
     const uint64_t timeout_cycles = scheduler_gm_query(control->scheduler_timeout_cycles);
+    cfg.sync_cohort_count = scheduler_gm_query(control->sync_cohort_count);
+    if (cfg.sync_cohort_count != 0) {
+        cfg.sync_block_total = scheduler_gm_query(control->sync_block_total);
+        cfg.sync_queue =
+            scheduler_state_at<PercounterSyncQueue>(control, scheduler_gm_query(control->sync_cohort_offset));
+        cfg.sync_pending = scheduler_state_at<uint64_t>(control, scheduler_gm_query(control->sync_pending_offset));
+    }
     cfg.mix_order_count = scheduler_gm_query(control->mix_order_count);
     if (cfg.mix_order_count != 0) {
         cfg.mix_rendezvous_count = scheduler_gm_query(control->mix_rendezvous_count);
