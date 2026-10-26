@@ -67,6 +67,7 @@ struct PercounterLayout {
     // reserved only when the graph has one.
     uint64_t graph_invocation_count;
     uint64_t graph_invocations_offset;
+    uint64_t graph_prepare_offset;
     uint64_t graph_templates_offset;
     uint64_t graph_templates_bytes;
     // The prefix of the region the host fills and uploads. The counters are the
@@ -204,6 +205,7 @@ inline bool plan_layout(
                                     !PERCOUNTER_RESERVE(2 * sync_cohort_count, uint64_t, sync_pending_offset))) ||
         (graph.invocation_count != 0 &&
          (!PERCOUNTER_RESERVE(graph.invocation_count, PercounterGraphInvocation, graph_invocations_offset) ||
+          !PERCOUNTER_RESERVE(1, PercounterGraphPrepare, graph_prepare_offset) ||
           !scheduler_layout_reserve(
               &cursor, graph.templates_bytes, alignof(PercounterGraphTemplate), &next.graph_templates_offset
           ))) ||
@@ -613,8 +615,17 @@ inline bool build_tables(
     auto *invocations = layout.graph_invocation_count != 0 ?
                             region_at<PercounterGraphInvocation>(base, layout.graph_invocations_offset) :
                             nullptr;
-    for (size_t k = 0; k < graph.invocation_count; ++k) {
-        PercounterGraphInvocation &record = invocations[k];
+    // Records go in the order the AICPU should materialize them: by their GRAPH
+    // task's key in the lists, so the body the lanes reach first exists first.
+    std::vector<size_t> rank(graph.invocation_count);
+    for (size_t k = 0; k < graph.invocation_count; ++k)
+        rank[k] = k;
+    std::stable_sort(rank.begin(), rank.end(), [&](size_t a, size_t b) {
+        return by_blevel(graph.invocations[a].shell_task_id, graph.invocations[b].shell_task_id);
+    });
+    for (size_t r = 0; r < graph.invocation_count; ++r) {
+        const size_t k = rank[r];
+        PercounterGraphInvocation &record = invocations[r];
         record = PercounterGraphInvocation{};
         record.template_offset = template_offset[graph.invocations[k].template_index];
         record.shell_task_id = static_cast<uint64_t>(graph.invocations[k].shell_task_id);
@@ -635,6 +646,7 @@ inline bool build_tables(
     control->sync_pending_offset = layout.sync_pending_offset;
     control->graph_invocation_count = layout.graph_invocation_count;
     control->graph_invocations_offset = layout.graph_invocations_offset;
+    control->graph_prepare_offset = layout.graph_prepare_offset;
     control->sync_block_total = sync_blocks;
     control->has_predicates = any_predicate ? 1 : 0;
     control->mix_order_offset = layout.mix_order_offset;

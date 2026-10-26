@@ -382,6 +382,35 @@ struct alignas(64) PercounterGraphInvocation {
     uint64_t reserved;
 };
 static_assert(sizeof(PercounterGraphInvocation) == 64, "a graph invocation owns exactly one cache line");
+
+/**
+ * The AICPU threads' shared state while they materialize the invocations.
+ *
+ * Only AICPU threads touch it, and their caches are coherent with each other, so
+ * its fields take plain atomics. The invocation records are in priority order,
+ * so drawing `next` hands out the most urgent body first.
+ */
+struct alignas(64) PercounterGraphPrepare {
+    uint64_t next;  // invocations claimed
+    uint8_t reserved0[56];
+    alignas(64) uint64_t prepared;  // invocations whose every body task is published
+    uint64_t first_publish_cycles;  // when the first body tasks were published; 0 = not yet
+    uint64_t prepared_cycles;       // when the last invocation was finished
+    uint64_t error;                 // first failure, a SchedulerGraphResult
+    uint64_t error_invocation;
+    uint8_t reserved1[24];
+};
+static_assert(sizeof(PercounterGraphPrepare) == 128, "the prepare record is two cache lines");
+static_assert(
+    std::is_trivially_copyable_v<PercounterGraphPrepare> && std::is_standard_layout_v<PercounterGraphPrepare>
+);
+
+/**
+ * Body tasks one AICPU draw materializes before it publishes them. Smaller
+ * gets the first body task to a lane sooner; larger flushes and publishes less
+ * often.
+ */
+inline constexpr int32_t PERCOUNTER_GRAPH_SLICE_TASKS = 16;
 static_assert(
     std::is_trivially_copyable_v<PercounterGraphInvocation> && std::is_standard_layout_v<PercounterGraphInvocation>
 );
@@ -497,6 +526,7 @@ struct alignas(128) PercounterControl {
     uint64_t table_task_count;
     uint64_t graph_invocation_count;
     uint64_t graph_invocations_offset;
+    uint64_t graph_prepare_offset;
     // The ring of queued cohort descriptors, one word per sync-start task, so a
     // sequence number never wraps and no enqueue finds it full.
     uint64_t sync_pending_offset;
@@ -530,7 +560,7 @@ struct alignas(128) PercounterControl {
     // overwrites it with any override when it publishes the topology.
     uint64_t scheduler_timeout_cycles;
     // Pads the progress counter below onto its own 64 B line.
-    uint8_t reserved[320 - 33 * sizeof(uint64_t)];
+    uint8_t reserved[320 - 34 * sizeof(uint64_t)];
 
     // **Alone on the last line.** Lanes batch their completions into this, and
     // the AICPU supervisor polls it against `executable_task_count`. It is the

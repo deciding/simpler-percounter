@@ -15,7 +15,8 @@
  * It runs the runtime's ordinary bring-up and retirement (AicpuExecutor with
  * AicoreLifecycle) and replaces three resident-specific steps with the ones
  * here: publishing the discovered topology into the control block, telling
- * each reported core READY, and watching the progress count.
+ * each reported core READY, and watching the progress count. The threads that
+ * do not watch materialize the Graph bodies (percounter_graph_prepare.h).
  *
  * Header-only because aicpu_executor.cpp is included by name into a unit test.
  */
@@ -35,6 +36,7 @@
 #include "common/unified_log.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/shared_memory.h"
+#include "percounter_graph_prepare.h"
 #include "runtime.h"
 #include "scheduler/percounter/percounter_types.h"
 #include "scheduler/scheduler_layout.h"
@@ -92,6 +94,7 @@ percounter_post_handshake_init(Runtime *runtime, const AicoreLifecycle &lifecycl
     // which only the AICPU reads.
     control->scheduler_timeout_cycles = scheduler_timeout_cycles;
     cache_flush_range(control, sizeof(*control));
+    percounter_graph_prepare_init(control);
     wmb();
     LOG_INFO("A5 HBG percounter: topology %d clusters x %d AIV", aic_count, PLATFORM_AIV_CORES_PER_BLOCKDIM);
     return 0;
@@ -121,6 +124,9 @@ inline void percounter_publish_partition(
     wmb();
 }
 
+/** What an AICPU thread other than the supervisor does while the lanes run. */
+inline void percounter_assist(Runtime *runtime) { percounter_prepare_graphs(runtime, percounter_control(runtime)); }
+
 /**
  * Wait until the lanes have run every executable block, a lane reports an
  * error, or progress stops for the scheduler timeout. Returns the run status
@@ -128,16 +134,21 @@ inline void percounter_publish_partition(
  *
  * The target is `executable_task_count`, not the task count: inline-completed
  * tasks are in no list, so no lane ever counts them.
+ *
+ * With no other AICPU thread to assist, the supervisor materializes the Graph
+ * bodies itself before it starts watching.
  */
-inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles) {
+inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles, int32_t aicpu_thread_count) {
     PercounterControl *control = percounter_control(runtime);
     if (control == nullptr || runtime->dev.host_total_tasks < 0 || runtime->get_gm_sm_ptr() == nullptr) {
         LOG_ERROR("A5 HBG percounter: supervisor requires an initialized graph");
         return -1;
     }
     auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+    const uint64_t start_cycles = get_sys_cnt_aicpu();
 
     cache_invalidate_range(control, sizeof(*control));
+    if (aicpu_thread_count <= 1) percounter_prepare_graphs(runtime, control);
     const uint64_t expected = control->executable_task_count;
     uint64_t last_resolved = ~uint64_t{0};
     uint64_t last_progress_cycles = get_sys_cnt_aicpu();
@@ -163,6 +174,8 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles) {
                 );
                 break;
             }
+            error = percounter_graph_prepare_error(control);
+            if (error != 0) break;
         }
         if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
             error = static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT);
@@ -171,6 +184,7 @@ inline int32_t percounter_supervise(Runtime *runtime, uint64_t timeout_cycles) {
         }
         SPIN_WAIT_HINT();
     }
+    percounter_graph_prepare_report(control, start_cycles);
     if (error == 0) return 0;
     (void)latch_aicore_scheduler_runtime_error(&header->sched_error_code, error);
     const int32_t rc = runtime_status_from_error_code(header->sched_error_code.load(std::memory_order_acquire));

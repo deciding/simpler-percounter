@@ -411,7 +411,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // Only the completion wait differs; the teardown below is the same for
         // every mode, and its barrier counts this thread.
         run_status_.store(
-            simpler::hbg::percounter::percounter_supervise(runtime, resident_scheduler_timeout_cycles()),
+            simpler::hbg::percounter::percounter_supervise(
+                runtime, resident_scheduler_timeout_cycles(), aicpu_thread_num_
+            ),
             std::memory_order_release
         );
         shutdown_ready_.store(true, std::memory_order_release);
@@ -532,6 +534,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     } else if (simpler::hbg::percounter::percounter_mode_enabled(runtime)) {
         // The percounter supervisor's own progress watchdog bounds this wait;
         // the ready watchdog's stamp is never advanced in this mode.
+        simpler::hbg::percounter::percounter_assist(runtime);
         while (!shutdown_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();
         }
