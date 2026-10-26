@@ -80,6 +80,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/types.h"
 #include "host_build_graph/runtime.h"
+#include "percounter/percounter_selection.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/runtime_c_api.h"
@@ -1133,6 +1134,7 @@ bool create_scheduler_state(
         );
         return false;
     }
+    if (!simpler::hbg::percounter::settle_scheduler_request(total_tasks)) return false;
     SchedulerGraphView host_graph{
         reinterpret_cast<uint64_t>(host_sm_handle.header->tasks.task_storage),
         0,

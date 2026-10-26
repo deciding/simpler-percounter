@@ -17,6 +17,9 @@ endmacro()
 a5_hbg_case(test_hbg_scheduler_contracts.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu)
 
+a5_hbg_case(test_hbg_percounter_selection.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
 a5_hbg_case(test_hbg_scheduler_bootstrap.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
