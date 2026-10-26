@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Whether a run asked for the percounter scheduler, and what the bind does
- * with that request.
+ * Whether a run asked for the percounter scheduler.
  *
  * Host-only: it reads the environment. Header-only because the UT targets that
  * compile runtime_maker.cpp list their sources by name, so a separate
@@ -56,26 +55,14 @@ inline bool parse_scheduler_request(const char *text, SchedulerRequest *out) {
 }
 
 /**
- * Settle this bind's scheduler request before the default selection runs.
- *
- * Returns false when SIMPLER_HBG_SCHEDULER_TYPE holds an unrecognised value,
- * which fails the bind. Otherwise the default selection runs: percounter
- * accepts no graph shape in this build, so a percounter request is logged as
- * falling back and changes nothing else.
+ * Read SIMPLER_HBG_SCHEDULER_TYPE. Returns false, after logging the value, when
+ * it is not a scheduler type; the caller fails the bind.
  */
-inline bool settle_scheduler_request(int32_t total_tasks) {
+inline bool resolve_scheduler_request(SchedulerRequest *out) {
     const char *text = std::getenv(SCHEDULER_TYPE_ENV);
-    SchedulerRequest request = SchedulerRequest::DEFAULT;
-    if (!parse_scheduler_request(text, &request)) {
+    if (!parse_scheduler_request(text, out)) {
         LOG_ERROR("A5 HBG: %s=%s is not a scheduler type; leave it unset or set percounter", SCHEDULER_TYPE_ENV, text);
         return false;
-    }
-    if (request == SchedulerRequest::PERCOUNTER) {
-        LOG_INFO(
-            "A5 HBG: %s=percounter for %d tasks: percounter accepts no graph shape, keeping the default scheduler "
-            "selection",
-            SCHEDULER_TYPE_ENV, total_tasks
-        );
     }
     return true;
 }

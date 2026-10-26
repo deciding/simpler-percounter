@@ -80,7 +80,7 @@
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/types.h"
 #include "host_build_graph/runtime.h"
-#include "percounter/percounter_selection.h"
+#include "percounter/percounter_state.h"
 #include "../../../../common/runtime_status/error_log.h"
 #include "../../../../common/task_interface/call_config.h"
 #include "../../../../common/worker/runtime_c_api.h"
@@ -1134,7 +1134,7 @@ bool create_scheduler_state(
         );
         return false;
     }
-    if (!simpler::hbg::percounter::settle_scheduler_request(total_tasks)) return false;
+    if (!simpler::hbg::percounter::check_scheduler_request(host_sm_handle, total_tasks)) return false;
     SchedulerGraphView host_graph{
         reinterpret_cast<uint64_t>(host_sm_handle.header->tasks.task_storage),
         0,
@@ -1295,6 +1295,11 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
+    const auto percounter = simpler::hbg::percounter::select_percounter_state(
+        runtime, api, host_sm_handle, total_tasks, task_metadata, inline_completed_task_ids, device_segments
+    );
+    if (percounter != simpler::hbg::percounter::StateSelection::DEFAULT)
+        return percounter == simpler::hbg::percounter::StateSelection::PERCOUNTER;
     if (legacy_shape_task_id >= 0) {
         select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(

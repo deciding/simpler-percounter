@@ -39,18 +39,22 @@ TEST(PercounterSelection, PercounterIsTheOnlyAcceptedValue) {
     }
 }
 
-TEST(PercounterSelection, SettleFailsTheBindOnlyForAnUnrecognisedValue) {
+TEST(PercounterSelection, ResolveReadsTheEnvironmentAndRejectsOnlyUnrecognisedValues) {
+    pc::SchedulerRequest request = pc::SchedulerRequest::PERCOUNTER;
     ASSERT_EQ(unsetenv(pc::SCHEDULER_TYPE_ENV), 0);
-    EXPECT_TRUE(pc::settle_scheduler_request(8));
+    ASSERT_TRUE(pc::resolve_scheduler_request(&request));
+    EXPECT_EQ(request, pc::SchedulerRequest::DEFAULT);
 
     ASSERT_EQ(setenv(pc::SCHEDULER_TYPE_ENV, "", 1), 0);
-    EXPECT_TRUE(pc::settle_scheduler_request(8));
+    ASSERT_TRUE(pc::resolve_scheduler_request(&request));
+    EXPECT_EQ(request, pc::SchedulerRequest::DEFAULT);
 
     ASSERT_EQ(setenv(pc::SCHEDULER_TYPE_ENV, "percounter", 1), 0);
-    EXPECT_TRUE(pc::settle_scheduler_request(8));
+    ASSERT_TRUE(pc::resolve_scheduler_request(&request));
+    EXPECT_EQ(request, pc::SchedulerRequest::PERCOUNTER);
 
     ASSERT_EQ(setenv(pc::SCHEDULER_TYPE_ENV, "resident", 1), 0);
-    EXPECT_FALSE(pc::settle_scheduler_request(8));
+    EXPECT_FALSE(pc::resolve_scheduler_request(&request));
 
     ASSERT_EQ(unsetenv(pc::SCHEDULER_TYPE_ENV), 0);
 }
