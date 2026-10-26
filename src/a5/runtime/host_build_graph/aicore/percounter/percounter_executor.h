@@ -908,21 +908,13 @@ inline __aicore__ void percounter_aicore_execute(__gm__ Runtime *runtime, int bl
     if (released) {
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
         run_percounter_lane(control, block_idx, core_type);
-        const uint64_t exit_wait_start = get_sys_cnt_aicore();
-        while (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
-            if (scheduler_watchdog_expired(exit_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
-                scheduler_gm_compare_exchange(
-                    control->lane_error, uint64_t{0}, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT)
-                );
-                break;
-            }
-            SPIN_WAIT_HINT();
-        }
     }
-    // A local watchdog may have ended any wait above before the AICPU signalled
-    // EXIT. The AICPU publishes this run's EXIT only after resetting the return
-    // gate, so wait for it before acknowledging, and complete the preceding GM
-    // writes first.
+    // A lane arrives here when its share of the run is done, which can be long
+    // before the run ends, or after a local watchdog ended a wait above. The
+    // AICPU sends EXIT on every outcome once its supervisor returns, and the
+    // supervisor has its own progress watchdog, so this wait needs none. EXIT
+    // is published only after the return gate is reset, so wait for it before
+    // acknowledging, and complete the preceding GM writes first.
     wait_for_aicpu_exit_signal();
     OUT_OF_ORDER_STORE_BARRIER();
     acknowledge_aicore_cond_nonce_and_wait(&runtime->dev.teardown_gates[block_idx]);

@@ -529,6 +529,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
         run_status_.store(supervisor_rc, std::memory_order_release);
         shutdown_ready_.store(true, std::memory_order_release);
+    } else if (simpler::hbg::percounter::percounter_mode_enabled(runtime)) {
+        // The percounter supervisor's own progress watchdog bounds this wait;
+        // the ready watchdog's stamp is never advanced in this mode.
+        while (!shutdown_ready_.load(std::memory_order_acquire)) {
+            SPIN_WAIT_HINT();
+        }
     } else {
         if (!ready_watchdog_.wait_until_ready(
                 [this] {
