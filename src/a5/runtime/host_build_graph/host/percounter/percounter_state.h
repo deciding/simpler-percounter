@@ -199,6 +199,7 @@ inline StateSelection select_percounter_state(
             order_count[0] += tmpl.orders[0].size();
             order_count[1] += tmpl.orders[1].size();
             mix_order_count += tmpl.orders[PERCOUNTER_LIST_MIX].size();
+            sync_cohort_count += tmpl.sync_cohort_count;
             ++block_total;
         } else if (!input.inline_completed) {
             input.sync_start = slot.task_attrs.requires_sync_start();

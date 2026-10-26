@@ -64,8 +64,9 @@ struct TemplateResult {
  * one range in each list, so this order and the outer graph's decide the whole
  * schedule; see build_tables for the outer half.
  *
- * A sync-start body task is unsupported: its blocks would be handed out from the
- * cohort queue, which numbers cohorts at bind.
+ * A sync-start body task takes one arming entry, as a task-table one does, and
+ * its blocks are handed out from the cohort queue; the template counts its
+ * cohorts so the queue can be sized for every invocation.
  */
 inline TemplateResult build_graph_template(
     const BodyTaskShape *shapes, int32_t task_count, const int32_t *fanin_offsets, const int32_t *fanin_indices,
@@ -112,7 +113,10 @@ inline TemplateResult build_graph_template(
             dummy ? TaskPlacement::AIV : task_placement_from_active_mask(shape.active_mask, &core_type);
         if (placement == TaskPlacement::UNSUPPORTED)
             return fail(TemplateStatus::UNSUPPORTED, "an AIV1-only body task", i);
-        if (shape.sync_start) return fail(TemplateStatus::UNSUPPORTED, "a sync-start body task", i);
+        // A cohort of one would be released by its own claim, and the arming
+        // sentinel must stay a value no real block index takes.
+        if (shape.sync_start && (dummy || shape.block_num < 2 || shape.block_num >= PERCOUNTER_ORDER_BLOCK_IDX_ARM))
+            return fail(TemplateStatus::MALFORMED, "a sync-start body task with an impossible block count", i);
         const int32_t subtasks = dummy ? 1 : __builtin_popcount(shape.active_mask);
         if (dummy ? (shape.block_num != 1 || shape.total_required_subtasks != 0 || shape.has_predicate) :
                     (shape.block_num < 1 || shape.block_num > UINT16_MAX / subtasks ||
@@ -136,8 +140,13 @@ inline TemplateResult build_graph_template(
             next.has_predicates = true;
         }
         next.executable_blocks += static_cast<uint64_t>(shape.block_num);
+        if (shape.sync_start) {
+            ++next.sync_cohort_count;
+            next.sync_block_total += static_cast<uint64_t>(shape.block_num);
+        }
         if (placement == TaskPlacement::MIX) {
-            next.mix_rendezvous_count += static_cast<uint64_t>(shape.block_num);
+            // A sync-start MIX task's rendezvous report to the cohort queue.
+            if (!shape.sync_start) next.mix_rendezvous_count += static_cast<uint64_t>(shape.block_num);
             eligible[PERCOUNTER_LIST_MIX].push_back(i);
         } else {
             eligible[core_type].push_back(i);
@@ -162,6 +171,10 @@ inline TemplateResult build_graph_template(
         std::stable_sort(eligible[l].begin(), eligible[l].end(), by_level);
         for (int64_t i : eligible[l]) {
             const int32_t blocks = shapes[i].block_num;
+            if (shapes[i].sync_start) {
+                next.orders[l].push_back(percounter_order_entry(i, PERCOUNTER_ORDER_BLOCK_IDX_ARM, blocks));
+                continue;
+            }
             for (int32_t b = 0; b < blocks; ++b)
                 next.orders[l].push_back(percounter_order_entry(i, b, blocks));
         }

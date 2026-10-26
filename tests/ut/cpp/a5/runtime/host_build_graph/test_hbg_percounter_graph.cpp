@@ -137,13 +137,6 @@ TEST(PercounterGraphTemplate, RefusesBodyShapesPercounterDoesNotRunAsUnsupported
     pc::HostGraphTemplate tmpl;
     {
         Body body;
-        pc::BodyTaskShape cohort = shape(kAiv, 2);
-        cohort.sync_start = true;
-        body.add(cohort);
-        EXPECT_EQ(body.build(&tmpl).status, pc::TemplateStatus::UNSUPPORTED);
-    }
-    {
-        Body body;
         body.add(shape(0x4));
         EXPECT_EQ(body.build(&tmpl).status, pc::TemplateStatus::UNSUPPORTED);
     }
@@ -154,6 +147,64 @@ TEST(PercounterGraphTemplate, RefusesBodyShapesPercounterDoesNotRunAsUnsupported
         body.add(predicated);
         EXPECT_EQ(body.build(&tmpl).status, pc::TemplateStatus::UNSUPPORTED);
     }
+}
+
+// A sync-start body task holds one arming entry, as a table one does, and the
+// template counts its cohort and blocks for the queue. A MIX one's rendezvous
+// report to the cohort queue, not to the MIX list.
+TEST(PercounterGraphTemplate, GivesASyncStartBodyTaskOneArmingEntry) {
+    Body body;
+    body.add(shape(kAic));
+    pc::BodyTaskShape cohort = shape(kMix, 24);
+    cohort.sync_start = true;
+    body.add(cohort, {0});
+    pc::HostGraphTemplate tmpl;
+    ASSERT_EQ(body.build(&tmpl).status, pc::TemplateStatus::OK);
+    ASSERT_EQ(tmpl.orders[pc::PERCOUNTER_LIST_MIX].size(), 1u);
+    EXPECT_TRUE(pc::percounter_order_is_arming(tmpl.orders[pc::PERCOUNTER_LIST_MIX][0]));
+    EXPECT_EQ(pc::percounter_order_block_num(tmpl.orders[pc::PERCOUNTER_LIST_MIX][0]), 24);
+    EXPECT_EQ(tmpl.sync_cohort_count, 1u);
+    EXPECT_EQ(tmpl.sync_block_total, 24u);
+    EXPECT_EQ(tmpl.mix_rendezvous_count, 0u);
+    EXPECT_EQ(tmpl.executable_blocks, 25u);
+    EXPECT_EQ(tmpl.tasks[1].subtask_total, 48u);
+
+    Body lonely;
+    pc::BodyTaskShape one = shape(kAiv, 1);
+    one.sync_start = true;
+    lonely.add(one);
+    EXPECT_EQ(lonely.build(&tmpl).status, pc::TemplateStatus::MALFORMED);
+}
+
+// Two invocations of a body with a cohort put two cohorts in the queue.
+TEST(PercounterGraphTables, CountsEveryInvocationsCohorts) {
+    Body body;
+    pc::BodyTaskShape cohort = shape(kAiv, 4);
+    cohort.sync_start = true;
+    body.add(cohort);
+    std::vector<pc::HostGraphTemplate> templates(1);
+    ASSERT_EQ(body.build(&templates[0]).status, pc::TemplateStatus::OK);
+    std::vector<pc::GraphInvocationInput> invocations{{0, 0}, {1, 0}};
+    std::vector<pc::TaskInput> tasks{
+        pc::TaskInput{0, false, false, 0, nullptr},
+        pc::TaskInput{0, false, false, 0, nullptr},
+    };
+    tasks[0].graph_invocation = 0;
+    tasks[1].graph_invocation = 1;
+    const uint64_t order_count[2] = {0, 2};
+    const pc::GraphLayoutInput graph{2, 2, pc::graph_template_bytes(templates[0])};
+    pc::PercounterLayout layout{};
+    ASSERT_TRUE(pc::plan_layout(2, 2 + 8, 0, order_count, &layout, 0, 2, graph));
+    Region region(layout.total_size);
+    ASSERT_TRUE(
+        pc::build_tables(
+            tasks.data(), 2, layout, region.base(), kDeviceBase, {}, nullptr,
+            pc::GraphPlanInput{templates.data(), 1, invocations.data(), 2}
+        )
+    );
+    const auto *control = pc::region_at<pc::PercounterControl>(region.base(), layout.control_offset);
+    EXPECT_EQ(control->sync_cohort_count, 2u);
+    EXPECT_EQ(control->sync_block_total, 8u);
 }
 
 // A dependency-only task runs nothing but still orders its consumers after its

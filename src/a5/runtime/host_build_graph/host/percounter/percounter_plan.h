@@ -93,6 +93,9 @@ struct HostGraphTemplate {
     uint64_t sink_subtask_total{0};
     uint64_t executable_blocks{0};
     uint64_t mix_rendezvous_count{0};
+    // Sync-start body tasks, and their blocks, per invocation.
+    uint64_t sync_cohort_count{0};
+    uint64_t sync_block_total{0};
     bool has_predicates{false};
     uint64_t depth{0};
 };
@@ -468,6 +471,8 @@ inline bool build_tables(
             counters[id].value = percounter_counter_preset(static_cast<int64_t>(tmpl.sink_subtask_total));
             executable_blocks += tmpl.executable_blocks;
             mix_rendezvous += tmpl.mix_rendezvous_count;
+            sync_cohorts += tmpl.sync_cohort_count;
+            sync_blocks += tmpl.sync_block_total;
             if (tmpl.has_predicates) any_predicate = true;
             for (uint32_t l = 0; l < PERCOUNTER_LIST_COUNT; ++l) {
                 if (!tmpl.orders[l].empty() && !accept(l, tmpl.orders[l].size(), id))
