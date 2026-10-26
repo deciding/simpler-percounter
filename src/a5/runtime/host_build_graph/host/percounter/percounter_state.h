@@ -291,9 +291,10 @@ inline StateSelection select_percounter_state(
     LOG_INFO(
         "A5 HBG: selected percounter for %d tasks (%" PRIu64 " AIC, %" PRIu64 " AIV and %" PRIu64
         " MIX list entries, %" PRIu64 " sync cohorts, %zu edges, %zu Graph invocations of %zu Definitions with %" PRIu64
-        " body tasks)",
+        " body tasks; %" PRIu64 " of %" PRIu64 " region bytes uploaded)",
         total_tasks, order_count[0], order_count[1], mix_order_count, sync_cohort_count, edges.size(),
-        graph.invocations.size(), graph.templates.size(), graph.layout.body_task_count
+        graph.invocations.size(), graph.templates.size(), graph.layout.body_task_count, layout.upload_size,
+        layout.total_size
     );
     return StateSelection::PERCOUNTER;
 }
