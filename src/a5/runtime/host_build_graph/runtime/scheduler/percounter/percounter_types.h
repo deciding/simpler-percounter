@@ -119,18 +119,22 @@ inline __aicore__ void percounter_mix_signal_clear(SCHEDULER_SSBUF PercounterMix
 inline __aicore__ bool percounter_mix_armed(uint32_t generation) { return (generation & 1U) != 0; }
 
 /**
- * One ticket per core type, drawn by every lane of that type.
+ * Tickets per core type: one per group of PERCOUNTER_TICKET_GROUP_LANES lanes.
  *
- * Sharding a ticket per cluster would make the shards fixed partitions: a
- * cluster would be committed to positions `c, c+C, c+2C, ...` of its list, and a
- * lane whose share is blocked could not take work another cluster holds. One
- * ticket per type keeps the queue work-conserving -- whichever lane is free
- * draws next -- at the cost of putting every lane of a type on one cache line.
- * A ticket serves one draw per ~170 cycles however many lanes share it, so it
- * limits a run only while a lane's whole task takes less than that times the
- * lane count; PERCOUNTER_CLAIM_BATCH divides the draws.
+ * A ticket serves one draw at a time, about 0.35 us each on a5. Lanes whose
+ * kernels all take the same time finish together and draw together, so one
+ * ticket per type queued 32 AIC draws: 5.6 us a draw on paged_attention_unroll
+ * Case1 and 4.5 us on manual_scope Case1, more than the rest of a task's
+ * scheduling. A group of lanes shares a ticket over its own blocks of the list
+ * (see percounter_group_position), so a burst queues one group.
+ *
+ * Fixed shards alone would not be work-conserving: a lane whose group's share
+ * is spent would idle while another group still had work. So a lane draws from
+ * its own group's ticket first and from the others' once its own is spent, and
+ * leaves only when every group's is.
  */
-inline constexpr uint32_t PERCOUNTER_TICKET_CAPACITY = 1;
+inline constexpr uint32_t PERCOUNTER_TICKET_CAPACITY = 16;
+inline constexpr uint32_t PERCOUNTER_TICKET_GROUP_LANES = 8;
 
 /**
  * One counter per 64 B cache line.
@@ -630,31 +634,57 @@ inline constexpr uint64_t PERCOUNTER_LONG_KERNEL_CYCLES = PLATFORM_PROF_SYS_CNT_
 inline constexpr uint64_t PERCOUNTER_SHORT_LIST_PER_LANE = 64;
 
 /**
- * Turn a ticket draw into the half-open range of order-list positions it owns.
- * Returns false when the draw starts at or past the end of the list.
+ * The order-list position of index `index` of group `group`'s share.
+ *
+ * The list is cut into blocks of PERCOUNTER_CLAIM_BATCH positions, block `c`
+ * belonging to group `c % group_count`. A group's indices run through its own
+ * blocks in list order, so a group's ticket hands out its share in list order.
+ */
+inline __aicore__ uint64_t percounter_group_position(uint64_t index, uint32_t group, uint32_t group_count) {
+    return ((index / PERCOUNTER_CLAIM_BATCH) * group_count + group) * PERCOUNTER_CLAIM_BATCH +
+           index % PERCOUNTER_CLAIM_BATCH;
+}
+
+/** How many of a list's `order_count` positions are group `group`'s share. */
+inline __aicore__ uint64_t percounter_group_size(uint64_t order_count, uint32_t group, uint32_t group_count) {
+    const uint64_t blocks = (order_count + PERCOUNTER_CLAIM_BATCH - 1) / PERCOUNTER_CLAIM_BATCH;
+    if (group >= blocks) return 0;
+    const uint64_t own = (blocks - group + group_count - 1) / group_count;
+    uint64_t size = own * PERCOUNTER_CLAIM_BATCH;
+    // The list's last block, short when the list does not fill it.
+    if ((blocks - 1) % group_count == group) size -= blocks * PERCOUNTER_CLAIM_BATCH - order_count;
+    return size;
+}
+
+/**
+ * Turn a ticket draw into the half-open range of a group's indices it owns
+ * (see percounter_group_position). Returns false when the draw starts at or
+ * past the end of the group's share, `group_size`.
  *
  *  - **Disjoint and ascending.** Each draw of `scheduler_gm_fetch_add(ticket,
- *    BATCH)` gets a distinct base `BATCH` apart, so the ranges tile the list in
+ *    BATCH)` gets a distinct base `BATCH` apart, so the ranges tile the share in
  *    order. A gap would strand a task -- a lane spinning on a counter nobody
  *    sets -- and an overlap would run one twice.
  *  - **Deadlock-free.** Every list is ordered by descending (b-level, -id), a
  *    key global across the lists (see build_tables). Take the incomplete task T
  *    with the greatest key. Its producers have strictly greater b-levels and
  *    everything before it in its own list has a greater key, so all of them are
- *    complete; the draws reached T's position, and the lane holding it has
- *    nothing left to wait for. The argument needs no topology, which is why a
- *    lane knows neither its cluster nor the cluster count to claim.
+ *    complete. If T's position is drawn, the lane holding it has nothing left
+ *    to wait for. If not, its group's ticket has reached it, so every position
+ *    that group has drawn is complete; a lane takes from another group only once
+ *    its own group's share is spent, so the group's lanes hold nothing but
+ *    complete positions and the next of them to draw takes T.
  *
- * The clamp matters: the draw counter keeps rising past the end of the list, so
- * the last real range straddles it and every later draw starts beyond it.
+ * The clamp matters: the draw counter keeps rising past the end of the share,
+ * so the last real range straddles it and every later draw starts beyond it.
  */
 inline __aicore__ bool
-percounter_claim_range(uint64_t base, uint64_t batch, uint64_t order_count, uint64_t *first, uint64_t *last_exclusive) {
+percounter_claim_range(uint64_t base, uint64_t batch, uint64_t group_size, uint64_t *first, uint64_t *last_exclusive) {
     if (first == nullptr || last_exclusive == nullptr || batch == 0) return false;
-    if (base >= order_count) return false;
+    if (base >= group_size) return false;
     *first = base;
-    // base < order_count holds, so this cannot wrap.
-    *last_exclusive = (order_count - base < batch) ? order_count : base + batch;
+    // base < group_size holds, so this cannot wrap.
+    *last_exclusive = (group_size - base < batch) ? group_size : base + batch;
     return true;
 }
 

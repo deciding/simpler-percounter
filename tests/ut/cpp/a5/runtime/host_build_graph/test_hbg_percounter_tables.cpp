@@ -25,10 +25,11 @@ namespace {
 
 namespace pcx = simpler::hbg::percounter;
 
-// One ticket per core type, and a draw yields a range of positions. These tests
-// stand in for the atomic the device uses: `scheduler_gm_fetch_add(ticket,
-// batch)` supplies bases `batch` apart, and what has to hold is that the ranges
-// tile the list in order and that none reaches past its end.
+// A group's ticket hands out its share of a list, and a draw yields a range of
+// the share's indices. These tests stand in for the atomic the device uses:
+// `scheduler_gm_fetch_add(ticket, batch)` supplies bases `batch` apart, and what
+// has to hold is that the ranges tile the share in order and that none reaches
+// past its end.
 
 // Successive bases must give ascending, non-overlapping ranges. If they ever
 // went backwards a lane could reach a task whose producers are still pending
@@ -91,6 +92,32 @@ TEST(PercounterClaim, ClampsTheStraddlingRangeAndRefusesEveryBasePastTheEnd) {
     EXPECT_FALSE(pcx::percounter_claim_range(0, 0, 6, &first, &last));
     EXPECT_FALSE(pcx::percounter_claim_range(0, 8, 6, nullptr, &last));
     EXPECT_FALSE(pcx::percounter_claim_range(0, 8, 6, &first, nullptr));
+}
+
+// The groups' shares must partition the list: a position no group owns strands
+// its task, one two groups own runs twice. Within a share the positions must
+// rise, or a group's ticket would hand out a task before one it depends on.
+TEST(PercounterClaim, GroupSharesPartitionTheListInOrder) {
+    for (uint32_t groups = 1; groups <= pcx::PERCOUNTER_TICKET_CAPACITY; ++groups) {
+        for (uint64_t order_count : {uint64_t{0}, uint64_t{1}, uint64_t{3}, uint64_t{4}, uint64_t{37}, uint64_t{257}}) {
+            std::vector<int> owned(static_cast<size_t>(order_count), 0);
+            for (uint32_t group = 0; group < groups; ++group) {
+                const uint64_t size = pcx::percounter_group_size(order_count, group, groups);
+                uint64_t previous = 0;
+                for (uint64_t index = 0; index < size; ++index) {
+                    const uint64_t position = pcx::percounter_group_position(index, group, groups);
+                    ASSERT_LT(position, order_count) << "groups=" << groups << " group=" << group << " index=" << index;
+                    if (index != 0) EXPECT_GT(position, previous);
+                    previous = position;
+                    ++owned[static_cast<size_t>(position)];
+                }
+            }
+            for (uint64_t p = 0; p < order_count; ++p) {
+                EXPECT_EQ(owned[static_cast<size_t>(p)], 1)
+                    << "groups=" << groups << " order_count=" << order_count << " position=" << p;
+            }
+        }
+    }
 }
 
 // --- placement from the active mask ---------------------------------------

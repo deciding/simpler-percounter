@@ -95,7 +95,11 @@ struct LaneConfig {
     __gm__ uint64_t *callable_addresses;
     uint32_t callable_count;
     __gm__ DispatchPayload *payload;
-    __gm__ PercounterTicket *ticket;
+    // This type's tickets, `ticket_group_count` of them; this lane draws from
+    // `ticket_group`'s first (see PERCOUNTER_TICKET_CAPACITY).
+    __gm__ PercounterTicket *tickets;
+    uint32_t ticket_group;
+    uint32_t ticket_group_count;
     __gm__ uint64_t *order;
     // Resolved once: the host writes these offsets at bind and never changes
     // them, so re-deriving them per probe would spend device loads on constants.
@@ -1104,11 +1108,12 @@ inline __aicore__ bool percounter_wait_for_entry(
 /**
  * The lane loop.
  *
- * Every lane of a core type draws from that type's single ticket, and a draw
- * yields a range of consecutive positions in the list. Whichever lane is free
- * takes the next range, and nothing is bound to a lane in advance. Deadlock
- * freedom follows from the list order alone -- see percounter_claim_range --
- * so the lane needs no topology.
+ * A lane draws from its group's ticket, and from the other groups' once its
+ * own is spent (see PERCOUNTER_TICKET_CAPACITY); a draw yields a range of
+ * consecutive indices of that group's share, which the lane maps to list
+ * positions as it reads them. Whichever lane of a group is free takes the
+ * group's next range, and nothing is bound to a lane in advance. Deadlock
+ * freedom follows from the list order -- see percounter_claim_range.
  *
  * Within its range the lane takes whichever position is ready rather than the
  * next in order, and blocks only when none is. A range is otherwise
@@ -1145,6 +1150,10 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
     // decode a lane drew ahead into a 110-task fan-out and the wave ran on 24 of
     // 32 AIC lanes. So a lane whose last kernel was long draws one at a time.
     uint64_t batch = cfg.first_batch;
+    // The group the current range was drawn from, and how many groups past its
+    // own this lane has found spent: it moves on in order and never comes back.
+    uint32_t range_group = cfg.ticket_group;
+    uint32_t spent_groups = 0;
     // The task this range has already proved ready. An SPMD task puts several
     // of its blocks in one range, and they share a fanin row, so without this
     // the scan re-reads every producer once per block. Exact rather than a
@@ -1164,12 +1173,25 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         percounter_mix_tick(cfg, &state);
 
         if (pending == 0) {
-            const uint64_t base = scheduler_gm_fetch_add(cfg.ticket->next, batch);
+            // Own group first, then each other group once its predecessor is
+            // spent. Draws keep rising past a share's end, so a spent group
+            // stays spent; every lane leaves once all are, through the drain
+            // when the graph has MIX or sync-start tasks.
             uint64_t range_end = 0;
-            // False means the list is spent: draws keep rising past its end, so
-            // every lane arriving after the last task leaves here, through the
-            // drain when the graph has MIX or sync-start tasks.
-            if (!percounter_claim_range(base, batch, cfg.order_count, &range_first, &range_end)) {
+            bool claimed = false;
+            while (spent_groups < cfg.ticket_group_count) {
+                range_group = (cfg.ticket_group + spent_groups) % cfg.ticket_group_count;
+                const uint64_t size = percounter_group_size(cfg.order_count, range_group, cfg.ticket_group_count);
+                if (size != 0) {
+                    const uint64_t base = scheduler_gm_fetch_add(cfg.tickets[range_group].next, batch);
+                    if (percounter_claim_range(base, batch, size, &range_first, &range_end)) {
+                        claimed = true;
+                        break;
+                    }
+                }
+                ++spent_groups;
+            }
+            if (!claimed) {
                 percounter_flush_done(cfg, &state);
                 percounter_mix_drain(cfg, &state, timeout_cycles);
                 break;
@@ -1185,7 +1207,9 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         bool failed = false;
         for (uint32_t probe = pending; probe != 0; probe &= probe - 1) {
             const uint32_t candidate = static_cast<uint32_t>(__builtin_ctz(probe));
-            const uint64_t candidate_entry = scheduler_gm_query(cfg.order[range_first + candidate]);
+            const uint64_t candidate_entry = scheduler_gm_query(
+                cfg.order[percounter_group_position(range_first + candidate, range_group, cfg.ticket_group_count)]
+            );
             // A Graph body's entry reads zero until the AICPU publishes it.
             if (percounter_order_block_num(candidate_entry) == 0) continue;
             PercounterTask candidate_task{};
@@ -1204,7 +1228,9 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         if (failed) break;
         if (!found) {
             slot = static_cast<uint32_t>(__builtin_ctz(pending));
-            if (!percounter_wait_for_entry(cfg, &cfg.order[range_first + slot], &state, timeout_cycles, &entry)) break;
+            __gm__ uint64_t *slot_entry =
+                &cfg.order[percounter_group_position(range_first + slot, range_group, cfg.ticket_group_count)];
+            if (!percounter_wait_for_entry(cfg, slot_entry, &state, timeout_cycles, &entry)) break;
             if (!percounter_resolve(cfg, percounter_order_task_id(entry), &task)) break;
         }
         pending &= ~(uint32_t{1} << slot);
@@ -1272,9 +1298,9 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
         control, scheduler_gm_query(control->dispatch_payloads_offset) +
                      static_cast<uint64_t>(block_idx) * sizeof(DispatchPayload)
     );
-    cfg.ticket = scheduler_state_at<PercounterTicket>(
-        control,
-        scheduler_gm_query(control->tickets_offset) + static_cast<uint64_t>(type_index) * sizeof(PercounterTicket)
+    cfg.tickets = scheduler_state_at<PercounterTicket>(
+        control, scheduler_gm_query(control->tickets_offset) +
+                     static_cast<uint64_t>(type_index) * PERCOUNTER_TICKET_CAPACITY * sizeof(PercounterTicket)
     );
     cfg.order = scheduler_state_at<uint64_t>(control, scheduler_gm_query(control->orders_offset[type_index]));
     cfg.fanin = scheduler_state_at<PercounterFanin>(control, scheduler_gm_query(control->fanin_offset));
@@ -1285,6 +1311,13 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.order_count = scheduler_gm_query(control->order_count[type_index]);
     const uint64_t lanes = is_aic ? cluster_count : cluster_count * aiv_per_cluster;
     cfg.first_batch = cfg.order_count <= PERCOUNTER_SHORT_LIST_PER_LANE * lanes ? uint64_t{1} : PERCOUNTER_CLAIM_BATCH;
+    // Every lane of the type derives the same count from the topology. Grouping
+    // by cluster keeps a cluster's two AIVs on one ticket.
+    const uint64_t groups = lanes / PERCOUNTER_TICKET_GROUP_LANES;
+    cfg.ticket_group_count = static_cast<uint32_t>(
+        groups == 0 ? 1 : (groups > PERCOUNTER_TICKET_CAPACITY ? PERCOUNTER_TICKET_CAPACITY : groups)
+    );
+    cfg.ticket_group = static_cast<uint32_t>(coordinate.cluster_index) % cfg.ticket_group_count;
     cfg.has_predicates = scheduler_gm_query(control->has_predicates) != 0;
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
