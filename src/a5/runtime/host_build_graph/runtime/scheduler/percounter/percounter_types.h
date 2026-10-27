@@ -620,6 +620,15 @@ inline constexpr uint64_t PERCOUNTER_CLAIM_BATCH = 4;
 // below it.
 inline constexpr uint64_t PERCOUNTER_LONG_KERNEL_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1000000 * 3;
 
+// A list of at most this many positions per lane of its type makes each lane's
+// first draw a single position. A lane has timed no kernel before its first
+// draw, and on such a list a first range of long or not-yet-ready tasks is a
+// large share of the lane's work, held while other lanes go idle. Measured on a5
+// (AICore window): paged_attention_unroll Case2 -18%, manual_scope Case2 -10%,
+// batch_paged_attention Case1 (64 per AIC lane) -5%; applied to every list it
+// cost paged_attention B64 (256 per lane) +5% and Case1 (1024) +1.6%.
+inline constexpr uint64_t PERCOUNTER_SHORT_LIST_PER_LANE = 64;
+
 /**
  * Turn a ticket draw into the half-open range of order-list positions it owns.
  * Returns false when the draw starts at or past the end of the list.

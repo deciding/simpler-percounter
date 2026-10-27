@@ -106,6 +106,10 @@ struct LaneConfig {
     // Ids below this are task-table tasks; the rest are Graph body tasks.
     uint64_t table_task_count;
     uint64_t order_count;
+    // The size of this lane's first draw: one on a list short enough that a
+    // first range could hold most of a lane's share (see
+    // PERCOUNTER_SHORT_LIST_PER_LANE), PERCOUNTER_CLAIM_BATCH otherwise.
+    uint64_t first_batch;
     // Whether any task carries a dispatch predicate; a graph without one never
     // reads the predicate words.
     bool has_predicates;
@@ -1140,7 +1144,7 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
     // short kernels (fewer ticket atomics) and costs with long ones: on qwen3
     // decode a lane drew ahead into a 110-task fan-out and the wave ran on 24 of
     // 32 AIC lanes. So a lane whose last kernel was long draws one at a time.
-    uint64_t batch = PERCOUNTER_CLAIM_BATCH;
+    uint64_t batch = cfg.first_batch;
     // The task this range has already proved ready. An SPMD task puts several
     // of its blocks in one range, and they share a fanin row, so without this
     // the scan re-reads every producer once per block. Exact rather than a
@@ -1244,9 +1248,10 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     const bool is_aic = core_type == CoreType::AIC;
     const uint32_t type_index = is_aic ? 0U : 1U;
     SchedulerClusterCoordinate coordinate{-1, -1};
+    const uint64_t cluster_count = scheduler_gm_query(control->cluster_count);
+    const uint64_t aiv_per_cluster = scheduler_gm_query(control->aiv_per_cluster);
     if (!scheduler_cluster_coordinate_from_worker(
-            block_idx, is_aic, static_cast<int32_t>(scheduler_gm_query(control->cluster_count)),
-            static_cast<int32_t>(scheduler_gm_query(control->aiv_per_cluster)), &coordinate
+            block_idx, is_aic, static_cast<int32_t>(cluster_count), static_cast<int32_t>(aiv_per_cluster), &coordinate
         )) {
         // A lane outside the topology the AICPU published has no payload slot.
         scheduler_gm_compare_exchange(
@@ -1278,6 +1283,8 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.task_count = scheduler_gm_query(control->task_count);
     cfg.table_task_count = scheduler_gm_query(control->table_task_count);
     cfg.order_count = scheduler_gm_query(control->order_count[type_index]);
+    const uint64_t lanes = is_aic ? cluster_count : cluster_count * aiv_per_cluster;
+    cfg.first_batch = cfg.order_count <= PERCOUNTER_SHORT_LIST_PER_LANE * lanes ? uint64_t{1} : PERCOUNTER_CLAIM_BATCH;
     cfg.has_predicates = scheduler_gm_query(control->has_predicates) != 0;
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
