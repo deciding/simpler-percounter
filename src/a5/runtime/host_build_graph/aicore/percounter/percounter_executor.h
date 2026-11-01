@@ -314,6 +314,67 @@ inline __aicore__ __gm__ int32_t *percounter_kernel_ids(const PercounterTask &ta
 }
 
 /**
+ * How many positions one draw takes from `group`'s share, at most `want`.
+ *
+ * A range withholds its positions from every other lane until the lane holding
+ * it runs them, so several blocks of one task in one range serialise blocks that
+ * would otherwise have run side by side. The bound is the task's own optimal
+ * share -- what one lane runs when the task is spread over every lane of its
+ * type -- so a capped draw never lengthens a task's makespan.
+ *
+ * **The bound is per task, not per range.** A run of single-block tasks still
+ * draws a full PERCOUNTER_CLAIM_BATCH, which is what keeps the ticket off the
+ * critical path when kernels are short: the ticket serves one draw at a time,
+ * and lanes whose kernels are shorter than that cost times the lanes sharing it
+ * queue on it.
+ *
+ * The draw point is read without the ticket, so another lane can take it first
+ * and this lane's range start elsewhere. That mis-sizes a range and never
+ * misplaces one: the ticket still hands out the range, and
+ * `percounter_claim_range` clamps whatever comes back against the share.
+ */
+inline __aicore__ uint64_t
+percounter_draw_width(const LaneConfig &cfg, uint32_t group, uint64_t group_size, uint64_t want) {
+    // A single-position draw is already the narrowest, and the loads below are
+    // the whole cost of this function, so the long-kernel path pays nothing.
+    if (want <= 1) return want;
+    const uint64_t lanes = static_cast<uint64_t>(cfg.ticket_group_count) * PERCOUNTER_TICKET_GROUP_LANES;
+    const uint64_t index = scheduler_gm_query(cfg.tickets[group].next);
+    // Holding several positions of one task costs availability only when an
+    // idle lane would have taken them. While the group's share still holds a
+    // full range for each of its lanes there is no such lane, so the draw keeps
+    // its width -- and a list long enough for that is also the one where the
+    // ticket, served one draw at a time, is what narrow draws would queue on.
+    if (index < group_size && group_size - index >= PERCOUNTER_TICKET_GROUP_LANES * want) return want;
+    uint64_t taken = 0;
+    int64_t run_task = -1;
+    uint64_t run = 0;
+    uint64_t allowed = 1;
+    while (taken < want && index + taken < group_size) {
+        const uint64_t entry =
+            scheduler_gm_query(cfg.order[percounter_group_position(index + taken, group, cfg.ticket_group_count)]);
+        const uint64_t blocks = static_cast<uint64_t>(percounter_order_block_num(entry));
+        // A Graph body's entry reads zero until the AICPU publishes it. An
+        // unpublished entry states no width, so the range stops short of it and
+        // the next draw sees it published.
+        if (blocks == 0) break;
+        const int64_t id = percounter_order_task_id(entry);
+        if (id != run_task) {
+            run_task = id;
+            run = 0;
+            allowed = lanes == 0 ? blocks : (blocks + lanes - 1) / lanes;
+            if (allowed == 0) allowed = 1;
+        }
+        if (run == allowed) break;
+        ++run;
+        ++taken;
+    }
+    // A draw of nothing would leave the lane spinning on a ticket it never
+    // advances; one position is what the share's first entry is worth.
+    return taken == 0 ? 1 : taken;
+}
+
+/**
  * Run `kernel_id` as subtask `subtask_slot` of one block of `task_id`.
  * `kernel_start` receives the timestamp before the kernel call.
  *
@@ -1149,6 +1210,10 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
     // short kernels (fewer ticket atomics) and costs with long ones: on qwen3
     // decode a lane drew ahead into a 110-task fan-out and the wave ran on 24 of
     // 32 AIC lanes. So a lane whose last kernel was long draws one at a time.
+    //
+    // That bound is what the lane has already run, so it cannot reach a long
+    // kernel the lane meets for the first time; `percounter_draw_width` bounds
+    // the same draw by what the tasks at the draw point are worth instead.
     uint64_t batch = cfg.first_batch;
     // The group the current range was drawn from, and how many groups past its
     // own this lane has found spent: it moves on in order and never comes back.
@@ -1183,8 +1248,9 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
                 range_group = (cfg.ticket_group + spent_groups) % cfg.ticket_group_count;
                 const uint64_t size = percounter_group_size(cfg.order_count, range_group, cfg.ticket_group_count);
                 if (size != 0) {
-                    const uint64_t base = scheduler_gm_fetch_add(cfg.tickets[range_group].next, batch);
-                    if (percounter_claim_range(base, batch, size, &range_first, &range_end)) {
+                    const uint64_t width = percounter_draw_width(cfg, range_group, size, batch);
+                    const uint64_t base = scheduler_gm_fetch_add(cfg.tickets[range_group].next, width);
+                    if (percounter_claim_range(base, width, size, &range_first, &range_end)) {
                         claimed = true;
                         break;
                     }
