@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Per-task first/last device stamps for BOTH schedulers, 64 task ids, no folding.
+"""Per-task first/last device stamps for BOTH schedulers, 128 task ids, no folding.
 
 Applies on top of `counter_patch.py count` and `window_patch.py`. It is
 `tasktime2_patch.py`'s percounter half -- which holds 64 tasks because it writes
@@ -62,7 +62,7 @@ def sub(rel, old, new, count=1):
     p.write_text(s.replace(old, new))
 
 
-TASKS = 64
+TASKS = 128
 NL = chr(10)
 
 # --- percounter: the AICore lane, keyed by task.local ----------------------
