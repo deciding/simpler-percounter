@@ -26,10 +26,9 @@ NEW = """        uint64_t cursor = 0;
         for (int64_t id : eligible[l]) {
             const TaskInput &placed_task = tasks[static_cast<size_t>(id)];
             LOG_WARN(
-                "EXPO list=%u pos=%llu task=%lld blocks=%d blevel=%d tlevel=%d", l,
+                "EXPO list=%u pos=%llu task=%lld blocks=%d blevel=%d", l,
                 static_cast<unsigned long long>(cursor), static_cast<long long>(id),
-                static_cast<int>(placed_task.block_num), blevel[static_cast<size_t>(id)],
-                tlevel[static_cast<size_t>(id)]
+                static_cast<int>(placed_task.block_num), blevel[static_cast<size_t>(id)]
             );
 """
 p.write_text(s.replace(OLD, NEW))

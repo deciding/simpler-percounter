@@ -124,7 +124,7 @@ signal buffer 发出来是 32 字节宽，被 `allocate_domain` 直接拒掉。�
 每个补丁的 docstring 写了它测什么、为什么这样测、以及它自己的失真。
 
 | 补丁 | 日志前缀 | 回答的问题 |
-| ---- | ---- | ---- |
+| ---- | -------- | ---------- |
 | `tasktime_patch.py` | `EXPT` | 一条串行链的时间分到每一级，两种调度器都有 |
 | `tasktime3_patch.py` | `EXPS` | 同上，但容量 64 个任务且不折叠：percounter 写每个任务自己的计数器行 |
 | `blocktrace_patch.py` | `EXPB` | 一个任务**逐块**的领取时刻、执行时刻、执行它的 lane，以及该 lane 在这两刻的累计 kernel 数与忙时。分辨"领得早跑得晚"（lane 的问题）与"领得晚立刻跑"（列表的问题） |
@@ -136,7 +136,7 @@ signal buffer 发出来是 32 字节宽，被 `allocate_domain` 直接拒掉。�
 还有一组是**改行为**的，用来给某个假设定价，不是候选修法：
 
 | 补丁 | 改什么 |
-| ---- | ---- |
+| ---- | ------ |
 | `spin_backoff_patch.py` | `PERCOUNTER_SPIN_BACKOFF_CYCLES` |
 | `drawwidth_patch.py` | 按任务宽度限制一次领取，`guard` / `noguard` 两种形态 |
 | `obscache_patch.py` | 每块的整缓存失效改成只失效 payload 自己的行，或整个去掉 |
@@ -150,3 +150,39 @@ signal buffer 发出来是 32 字节宽，被 `allocate_domain` 直接拒掉。�
 这些实验各自的结论记在
 [`docs/zh-cn/percounter/perf-results.md`](../../docs/zh-cn/percounter/perf-results.md)
 的"排除掉的候选"一节。
+
+## 顺序表的扫描
+
+`helpers/order_misfit.py` 读一个波次的运行目录，找出**同一 b-level 内次序与就绪
+先后相反**的任务对，并给每一对打分。它需要的三样数据来自 `graphdump_patch.py`、
+`orderdump_patch.py` 和 `tasktime3_patch.py`，一次构建全打上即可。
+
+```bash
+python3 tools/percounter-perf/helpers/order_misfit.py ~/runs/scan1
+```
+
+只看同层是有理由的：跨层的"未就绪任务排在前面"是 b-level 的判断，而它是对的——
+实测把 b-level 换成就绪序会亏 7.10%，因为一条停在"后面吊着大量工作"的任务上的
+lane 是一个**预置的扳机**，生产者一完成它立刻就发。同层任务之间没有边，b-level
+对它们没有意见，现在由 task id 决定，那才是可以免费改的地方。
+
+打分是四项的乘积，每一项排除一种"救不回来"的情形：
+
+```text
+lanes_held = min(靠前者块数, lane 池, 靠后者块数, 紧邻前驱的块数)
+score      = lanes_held × (靠前者就绪时刻 − 靠后者就绪时刻)
+```
+
+后两项都是被反例教出来的。**靠后者块数**：192 块的任务挡在 **3 块**的任务前面，
+最多救三条 lane，两处这样的候选实测只值 0.17% 和 0.40%。**紧邻前驱的块数**：lane
+只有在前一段工作把它们**同时**释放时才会一拥而上，值 10.3% 的那一对前面是个 256
+块的任务，而 `prefill_attn_swa` 的两对前面只有 16 块——实测它们的靠后任务是在自己
+的就绪时刻开始的，**从未被挡住**，交换反而亏 0.5%。
+
+**高分是候选，不是结论。** 这个模型对 swa 仍然高估一个数量级以上。确认一个候选要
+两步：
+
+1. `blocktrace_patch.py` 盯靠前的那个任务。真的被挡住，会看到很大的"领取到执行"
+   间隔、而同期 kernel 忙时很小。
+2. `orderafter_patch.py` 配 `SIMPLER_EXP_ORDER_AFTER=靠前:靠后` 做同时段 A/B，
+   **先读 `rc=` 和 `passed=`，再读时间**。
