@@ -3,6 +3,9 @@
 讲一个已经定位到单个块的例子：DeepSeek-V4.1-Flash 的 prefill attention（C2A
 cache-reuse 变体）在 a5 host_build_graph 上，percounter 比 legacy 慢 13%。
 
+同一个模块的顺序表上还有一处**独立的、大十五倍**的问题，排序就能修，值 10%，
+单独写在[顺序表排错了一对任务](order-list-problem.md)。两者互不相干。
+
 本页只讲这一个例子和它的成因。各模块的完整数字、以及一路上排除掉的十二个候选，
 在[性能结果](perf-results.md)里。
 

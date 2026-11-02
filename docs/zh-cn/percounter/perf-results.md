@@ -434,7 +434,8 @@ legacy 不双峰"也由此解释：哪几条 lane 抽到采样那段区间每次
 
 ### prefill 落后：收敛到一个块
 
-本节是调查过程和排除依据。成因本身、以及给没有背景的读者的讲法，在
+本节是调查过程和排除依据。给没有背景的读者的讲法在
+[顺序表排错了一对任务](order-list-problem.md)（顺序问题，值 10%）和
 [percounter 为什么在 prefill attention 上慢于 legacy](prefill-attention-deficit.md)。
 
 **基线**（五个模块，同一波次，干净二进制，device wall 中位数 ns）：
