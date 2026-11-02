@@ -186,3 +186,28 @@ score      = lanes_held × (靠前者就绪时刻 − 靠后者就绪时刻)
    间隔、而同期 kernel 忙时很小。
 2. `orderafter_patch.py` 配 `SIMPLER_EXP_ORDER_AFTER=靠前:靠后` 做同时段 A/B，
    **先读 `rc=` 和 `passed=`，再读时间**。
+
+## 按 lane 的时间预算
+
+其余探针都按任务或按块。两者都答不了"一个任务的块各自领到手就跑得很快，整体却慢
+十倍"——块是陆续被领走的，所以问题在池，而池是别的探针不量的维度。
+
+`patches/lanebudget_patch.py` 把每条 lane 的生命分成四份，按核类型汇总打 `EXPL`：
+
+| 项 | 含义 |
+| -- | ---- |
+| `mix` | 在 MIX rendezvous 里执行（`percounter_run_subtask`） |
+| `list` | 执行普通列表工作（`percounter_run_task`） |
+| `wait` | 阻塞在生产者计数器的自旋上，手里握着一个未就绪的位置 |
+| `life` | lane 生命周期，用来把上面三项读成比例 |
+
+`wait` 直接取仓库自带的 `cfg.kx[2]`——那个 fanin 等待循环的出口本来就在累加它。
+**四项之和会超过 `life`**：等待循环里会调 `percounter_checkpoint_serve`，lane 可能
+在等待期间服务一个 MIX 块，那段时间被两边各算一次。所以 `wait` 是上界。
+
+`patches/straggler_patch.py` 是 `blocktrace_patch.py` 的补充：后者每块四个字，只装得
+下八块，而一个 64 块任务的头八块往往都正常。它只留一条记录——"领取到执行"间隔最大
+的那一块——并把 `hold << 32 | block << 24 | kernels << 16 | lane` 打包进一个字，这样
+max-CAS 搬运的是一条一致的记录，不会出现 hold 来自这一块、lane 来自另一块。
+`kernels` 是判据：1 表示 lane 一直空坐（纯依赖等待），2 表示它先跑了另一个 kernel
+才回来，远大于 2 才可能是连续进出多个 rendezvous。
