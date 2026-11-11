@@ -259,6 +259,7 @@ inline StateSelection select_percounter_state(
     // Each lane's payload keeps these fields for the whole run: its argument
     // vector points at its own contexts. A lane rewrites the block fields for
     // every block it runs.
+    const uint64_t async_run_epoch = region_at<PercounterControl>(host_base, layout.control_offset)->async_run_epoch;
     for (uint64_t lane = 0; lane < SCHEDULER_WORKER_CAPACITY; ++lane) {
         const uint64_t offset = layout.dispatch_payloads_offset + lane * sizeof(DispatchPayload);
         auto *payload = region_at<DispatchPayload>(host_base, offset);
@@ -269,6 +270,18 @@ inline StateSelection select_percounter_state(
         payload->local_context.block_num = 1;
         payload->local_context.async_ctx.task_token = TaskId::invalid();
         payload->src_payload = 0;
+        // The resident deferred-completion context, bind-time constants like the
+        // two context arguments above: this lane's record never moves, so a
+        // dispatch rewrites none of these. The legacy slab above stays invalid,
+        // which is what sends `get_async_ctx` down the resident path.
+        payload->global_context.async_present = 1;
+        payload->global_context.async_image_address = device_base;
+        payload->global_context.async_image_bytes = layout.total_size;
+        payload->global_context.async_run_epoch = async_run_epoch;
+        payload->global_context.async_group_offset =
+            layout.async_groups_offset + lane * sizeof(pto2::resident::AsyncGroupData);
+        payload->global_context.async_group_index = static_cast<uint32_t>(lane);
+        payload->global_context.async_reserved = 0;
     }
 
     runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_PERCOUNTER, device_base + layout.control_offset);
