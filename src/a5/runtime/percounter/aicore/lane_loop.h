@@ -484,9 +484,9 @@ inline __aicore__ bool percounter_async_seal(
         // into a record that holds four, rather than only that something
         // about the registration was wrong.
         percounter_fail(
-            cfg, error == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW      ? SchedulerGraphResult::ASYNC_WAIT_OVERFLOW
-                 : error == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ? SchedulerGraphResult::ASYNC_COMPLETION_INVALID
-                                                                   : SchedulerGraphResult::ASYNC_REGISTRATION_FAILED
+            cfg, error == SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW      ? SchedulerGraphResult::ASYNC_WAIT_OVERFLOW :
+                 error == SIMPLER_ERROR_ASYNC_COMPLETION_INVALID ? SchedulerGraphResult::ASYNC_COMPLETION_INVALID :
+                                                                   SchedulerGraphResult::ASYNC_REGISTRATION_FAILED
         );
         return false;
     }
@@ -558,8 +558,7 @@ inline __aicore__ void percounter_async_settle(const LaneConfig &cfg, Percounter
  * is below every supported threshold and reads as pending rather than as a
  * large unsigned value.
  */
-inline __aicore__ bool
-percounter_async_tick(const LaneConfig &cfg, PercounterLaneState *state, bool *settled) {
+inline __aicore__ bool percounter_async_tick(const LaneConfig &cfg, PercounterLaneState *state, bool *settled) {
     *settled = false;
     if (state->async_outstanding_hint == 0) return true;
     const SchedulerAsyncCompletionObserver observe{};
@@ -611,9 +610,8 @@ percounter_async_tick(const LaneConfig &cfg, PercounterLaneState *state, bool *s
  * within the watchdog -- which is a condition that never held, and is reported
  * as this lane's TIMEOUT rather than left for the op-execute timeout.
  */
-inline __aicore__ bool percounter_async_acquire(
-    const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, uint32_t *slot
-) {
+inline __aicore__ bool
+percounter_async_acquire(const LaneConfig &cfg, PercounterLaneState *state, uint64_t timeout_cycles, uint32_t *slot) {
     const uint64_t start = get_sys_cnt_aicore();
     uint32_t checks = 0;
     while (true) {
@@ -722,8 +720,8 @@ inline __aicore__ bool percounter_launch_kernel(
  * nothing, leaves `kernel_start` untouched, and is published like any other.
  */
 inline __aicore__ bool percounter_run_task(
-    const LaneConfig &cfg, PercounterLaneState *state, const PercounterTask &task, int32_t block_idx,
-    int32_t block_num, uint64_t timeout_cycles, bool may_defer, uint64_t *kernel_start, bool *deferred
+    const LaneConfig &cfg, PercounterLaneState *state, const PercounterTask &task, int32_t block_idx, int32_t block_num,
+    uint64_t timeout_cycles, bool may_defer, uint64_t *kernel_start, bool *deferred
 ) {
     *deferred = false;
     scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(cfg.payload));
@@ -1990,8 +1988,8 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
         // single share itself, so it is the lane that can withhold it.
         bool deferred = false;
         if (!percounter_run_task(
-                cfg, &state, task, percounter_order_block_idx(entry), percounter_order_block_num(entry),
-                timeout_cycles, true, &kernel_start, &deferred
+                cfg, &state, task, percounter_order_block_idx(entry), percounter_order_block_num(entry), timeout_cycles,
+                true, &kernel_start, &deferred
             )) {
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             break;
@@ -2068,9 +2066,9 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.ticket_group = static_cast<uint32_t>(coordinate.cluster_index) % cfg.ticket_group_count;
     cfg.has_predicates = scheduler_gm_query(control->has_predicates) != 0;
     cfg.async_group = percounter_init_async_records(control, block_idx);
-    cfg.async_group_offset = scheduler_gm_query(control->async_groups_offset) +
-                             static_cast<uint64_t>(block_idx) * PERCOUNTER_ASYNC_SLOTS *
-                                 sizeof(pto2::resident::AsyncGroupData);
+    cfg.async_group_offset =
+        scheduler_gm_query(control->async_groups_offset) +
+        static_cast<uint64_t>(block_idx) * PERCOUNTER_ASYNC_SLOTS * sizeof(pto2::resident::AsyncGroupData);
     cfg.async_group_base_index = static_cast<uint32_t>(block_idx) * PERCOUNTER_ASYNC_SLOTS;
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
