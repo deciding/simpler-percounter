@@ -115,10 +115,6 @@ struct LaneConfig {
     // Ids below this are task-table tasks; the rest are Graph body tasks.
     uint64_t table_task_count;
     uint64_t order_count;
-    // The size of this lane's first draw: one on a list short enough that a
-    // first range could hold most of a lane's share (see
-    // PERCOUNTER_SHORT_LIST_PER_LANE), PERCOUNTER_CLAIM_BATCH otherwise.
-    uint64_t first_batch;
     // Whether any task carries a dispatch predicate; a graph without one never
     // reads the predicate words.
     bool has_predicates;
@@ -1947,11 +1943,11 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
     };
     uint64_t range_first = 0;
     uint32_t pending = 0;
-    // A range withholds its positions from every other lane, which pays with
-    // short kernels (fewer ticket atomics) and costs with long ones: on qwen3
-    // decode a lane drew ahead into a 110-task fan-out and the wave ran on 24 of
-    // 32 AIC lanes. So a lane whose last kernel was long draws one at a time.
-    uint64_t batch = cfg.first_batch;
+    // One position per draw. A range of them is withheld from every other lane
+    // until this one reaches them, so a lane that finds none of its range ready
+    // waits on one while the rest go unrun; the ticket atomics a range saves do
+    // not pay for that on a graph whose wall is dependency-bound.
+    const uint64_t batch = 1;
     // The group the current range was drawn from, and how many groups past its
     // own this lane has found spent: it moves on in order and never comes back.
     uint32_t range_group = cfg.ticket_group;
@@ -2059,9 +2055,6 @@ inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t time
             percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
             break;
         }
-        if (kernel_start != 0) {
-            batch = get_sys_cnt_aicore() - kernel_start >= PERCOUNTER_LONG_KERNEL_CYCLES ? 1 : PERCOUNTER_CLAIM_BATCH;
-        }
 
         // The block ran either way, so its execution progress is counted here
         // as always; only the counter its consumers watch waits for the
@@ -2121,7 +2114,6 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.table_task_count = scheduler_gm_query(control->table_task_count);
     cfg.order_count = scheduler_gm_query(control->order_count[type_index]);
     const uint64_t lanes = is_aic ? cluster_count : cluster_count * aiv_per_cluster;
-    cfg.first_batch = cfg.order_count <= PERCOUNTER_SHORT_LIST_PER_LANE * lanes ? uint64_t{1} : PERCOUNTER_CLAIM_BATCH;
     // Every lane of the type derives the same count from the topology. Grouping
     // by cluster keeps a cluster's two AIVs on one ticket.
     const uint64_t groups = lanes / PERCOUNTER_TICKET_GROUP_LANES;

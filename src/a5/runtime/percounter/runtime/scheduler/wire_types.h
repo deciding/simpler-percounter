@@ -709,38 +709,18 @@ static_assert(
 static_assert(std::is_trivially_copyable_v<PercounterControl> && std::is_standard_layout_v<PercounterControl>);
 
 /**
- * How many consecutive order-list positions one ticket draw hands out.
+ * How many consecutive order-list positions form one block of a group's share.
  *
- * With one position per draw the ticket bounds any graph whose tasks are shorter
- * than the draw cost times the lane count: `mixed_multi_root_4096` (4096 tasks,
- * no edges) spent 355 of its 844 us on the ticket. A range divides the draws by
- * `BATCH` and keeps the queue work-conserving -- nothing is bound to a lane
- * before it asks.
+ * The list is cut into blocks of this many positions, and block `c` belongs to
+ * group `c % group_count`, so a group's ticket hands its share out in list
+ * order and consecutive positions stay on one ticket.
  *
- * What a range costs is availability: a lane is committed to its positions, so
- * one holding `BATCH` blocked positions cannot hand them to an idle lane. The
- * two costs move against each other and no value wins everywhere; 4 is chosen on
- * the worst case against each shape's own best (B=1 3.11x off, B=2 1.76x, B=4
- * 1.39x, B=8 1.96x across the mixed_* DAGs and paged_attention Case1 on a5).
+ * This is not the size of a draw: a lane takes one position at a time. A range
+ * withholds the positions it has not reached from every other lane, so a lane
+ * that finds none of its range ready waits on one of them while the rest go
+ * unrun, and on a dependency-bound graph that is what bounds the wall.
  */
 inline constexpr uint64_t PERCOUNTER_CLAIM_BATCH = 4;
-
-// A kernel at least this long (3 us) makes a lane draw one position at a time. A
-// draw plus its readiness check is about 1 us, so above a few of those a range
-// saves a small share of each task while risking a whole kernel per position it
-// withholds. Measured on a5: qwen3 decode 29.60 -> 23.02 ms device wall, with no
-// change on the mixed_* DAGs or paged_attention Case1, whose ~2 us kernels stay
-// below it.
-inline constexpr uint64_t PERCOUNTER_LONG_KERNEL_CYCLES = PLATFORM_PROF_SYS_CNT_FREQ / 1000000 * 3;
-
-// A list of at most this many positions per lane of its type makes each lane's
-// first draw a single position. A lane has timed no kernel before its first
-// draw, and on such a list a first range of long or not-yet-ready tasks is a
-// large share of the lane's work, held while other lanes go idle. Measured on a5
-// (AICore window): paged_attention_unroll Case2 -18%, manual_scope Case2 -10%,
-// batch_paged_attention Case1 (64 per AIC lane) -5%; applied to every list it
-// cost paged_attention B64 (256 per lane) +5% and Case1 (1024) +1.6%.
-inline constexpr uint64_t PERCOUNTER_SHORT_LIST_PER_LANE = 64;
 
 /**
  * The order-list position of index `index` of group `group`'s share.
