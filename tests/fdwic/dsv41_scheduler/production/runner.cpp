@@ -18,6 +18,7 @@
 #include <iterator>
 #include <memory>
 #include <stdexcept>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -197,10 +198,15 @@ int run(int argc, char **argv) {
         config.runtime_env.ring_heap[i] = heaps[i];
         config.runtime_env.ring_dep_pool[i] = 131072;
     }
+    // Which runtime directory under the a5/onboard tree to load. The device
+    // graph image and the orchestration .so are identical across them, so a
+    // scheduler can be swapped by name alone.
+    const char *runtime_name_env = std::getenv("DSV41_RUNTIME_NAME");
+    const std::string runtime_name = runtime_name_env != nullptr ? runtime_name_env : "host_build_graph";
     worker.init(
-        (libraries / "host_build_graph/libhost_runtime.so").string(),
-        (libraries / "host_build_graph/libaicpu_kernel.so").string(),
-        (libraries / "host_build_graph/aicore_kernel.o").string(),
+        (libraries / (runtime_name + "/libhost_runtime.so")).string(),
+        (libraries / (runtime_name + "/libaicpu_kernel.so")).string(),
+        (libraries / (runtime_name + "/aicore_kernel.o")).string(),
         (libraries / "../dispatcher/libsimpler_aicpu_dispatcher.so").string(), device, &config
     );
     uint64_t comm = 0, comm_context = 0, window = 0;
@@ -320,7 +326,14 @@ int run(int argc, char **argv) {
         host_barrier(output, "launch-" + label, rank, ranks);
         worker.run(callable_id, &args, config);
         const auto mode = worker.last_scheduler_runtime_mode();
-        if (mode != 1 && mode != 2) throw std::runtime_error("Production AICore scheduler was not selected");
+        // 1 and 2 are the resident AICore scheduler's modes; 5 is percounter,
+        // which dispatches from the lanes themselves. Both are production
+        // device schedulers, and the guard exists to reject a silent fallback
+        // to the AICPU dispatcher, not to pin one of them.
+        if (mode != 1 && mode != 2 && mode != 5)
+            throw std::runtime_error(
+                "Production AICore scheduler was not selected (mode " + std::to_string(mode) + ")"
+            );
         host_barrier(output, "complete-" + label, rank, ranks);
         return mode;
     };
