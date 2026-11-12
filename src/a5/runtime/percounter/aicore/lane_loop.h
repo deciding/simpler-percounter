@@ -1545,19 +1545,30 @@ inline __aicore__ bool percounter_serve_mix(
     // Inside the kernel this lane polls nothing. Every participant has arrived,
     // so a cross-core channel wait in it has a peer to meet.
     uint64_t kernel_start = 0;
-    // The lowest participant publishes this block's whole share, so a subtask
-    // withholding its own would have to tell that lane which share to leave
-    // out -- which the signal line has no room to carry. A registration here
-    // is refused until that is built.
     bool deferred = false;
     if (!percounter_run_subtask(
-            cfg, state, task, cfg.cluster_lane, block_idx, block_num, timeout_cycles, false, &kernel_start, &deferred
+            cfg, state, task, cfg.cluster_lane, block_idx, block_num, timeout_cycles, true, &kernel_start, &deferred
         )) {
         percounter_fail(cfg, SchedulerGraphResult::INVALID_CALLABLE);
         return false;
     }
+    // **A deferring subtask takes its own share back out.** The lowest
+    // participant publishes the block's whole share below and cannot be told
+    // which of them to leave out -- the signal line is a full cache line with
+    // nowhere to carry a mask -- so this lane subtracts the one it owes and
+    // `percounter_async_settle` adds it again when its conditions hold. The
+    // counter is already signed and preset negative, so an intermediate below
+    // the preset is this mechanism's own arithmetic, not a special case; and
+    // it can only make the task look less complete, so a consumer waits
+    // longer, never starts early.
+    if (deferred) {
+        scheduler_gm_fetch_add(cfg.counters[task.id].value, ~uint64_t{0});
+        if (task.sink) scheduler_gm_fetch_add(cfg.counters[task.shell].value, ~uint64_t{0});
+    }
     // After the kernel's store barrier, so a peer that observes this token has
-    // observed the subtask's outputs.
+    // observed the subtask's outputs -- and after the subtraction above, which
+    // is what orders it before the publisher's add: that lane only adds once
+    // it has acquire-read this token.
     scheduler_ssbuf_store_release(&signal->finished[lane], generation);
 
     if ((uint32_t{1} << lane) == (mask & (~mask + 1U))) {
