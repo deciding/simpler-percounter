@@ -26,6 +26,9 @@
 #pragma once
 
 #include "aicore/aicore.h"
+#include "aicore/aicore_profiling_state.h"
+#include "aicore/chip_swimlane_collector_aicore.h"
+#include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
 #include "host_build_graph/runtime_status.h"
@@ -146,6 +149,10 @@ struct LaneConfig {
     uint64_t sync_block_total;
     __gm__ PercounterSyncQueue *sync_queue;
     __gm__ uint64_t *sync_pending;
+    // This core's swimlane channel, null unless the run collects AICore task
+    // timing. A lane writes its own records: no AICPU dispatcher sees when a
+    // percounter task ran, so nothing else can.
+    __gm__ ChipSwimlaneActiveHead *swimlane_head;
 };
 
 /**
@@ -222,6 +229,14 @@ struct PercounterLaneState {
     // graph that defers nothing -- leaves the checkpoint's tick at one local
     // test rather than a walk over the slots and their entry lines.
     uint32_t async_outstanding_hint;
+    // Which buffer this lane's next record goes in, and the per-dispatch token
+    // it carries. The token counts this lane's own dispatches, because
+    // percounter has no dispatch register to take one from.
+    ChipSwimlaneAicoreLocalState swimlane;
+    uint32_t swimlane_token;
+    // When the lane entered the dispatch, so a record states what it spent
+    // between a task it has proved ready and that task's first instruction.
+    uint64_t dispatch_entry;
 };
 
 /** Where a task's producer counters are: `addresses[0 .. count)`. */
@@ -707,10 +722,49 @@ inline __aicore__ bool percounter_launch_kernel(
 
     // The barrier is the publication fence a consumer's spin depends on: the
     // kernel's outputs are in memory before the atomic that announces them.
+    // Reserved before the kernel runs, which is the order the collector's
+    // reserve/commit pair is built for: the slot is fixed while the lane is
+    // still off the critical path.
+    __gm__ ChipSwimlaneAicoreTaskRecord *swimlane_record =
+        cfg.swimlane_head != nullptr ? chip_swimlane_aicore_reserve_task_record(cfg.swimlane_head, &state->swimlane) :
+                                       nullptr;
     PercounterKernelFunc kernel = reinterpret_cast<PercounterKernelFunc>(cfg.payload->function_bin_addr);
     *kernel_start = get_sys_cnt_aicore();
     kernel(reinterpret_cast<__gm__ int64_t *>(cfg.payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
+    if (cfg.swimlane_head != nullptr) {
+        const uint64_t kernel_end = get_sys_cnt_aicore();
+        // The fields are written here rather than through
+        // `chip_swimlane_aicore_commit_task_record`, whose token parameter is a
+        // `__gm__` handle: the only one a lane holds is the payload's, and that
+        // belongs to the deferred-completion path, which reads its validity.
+        // A body task's identity is an index within its shell, which the GLOBAL
+        // space cannot state, so it goes unnamed rather than named wrongly.
+        const TaskId token = task.shell < 0 ? TaskId::make_global(static_cast<int32_t>(task.local)) : TaskId::invalid();
+        if (swimlane_record != nullptr) {
+            swimlane_record->start_time = *kernel_start;
+            swimlane_record->end_time = kernel_end;
+            TaskId::assign(swimlane_record->task_token, token);
+            swimlane_record->reg_task_id = state->swimlane_token;
+            swimlane_record->receive_to_start_cycles = static_cast<uint32_t>(*kernel_start - state->dispatch_entry);
+            dcci(swimlane_record, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        }
+        ++state->swimlane_token;
+        // The resident scheduler's AICPU charges these per dispatch; percounter
+        // dispatches from the lane, so the lane is the only thing that can. The
+        // flush turns `live_record_count` into the buffer's record count, and a
+        // dispatch the reserve refused belongs to `dropped` rather than to a
+        // buffer that never received it. Each core owns its own head, so the
+        // pool's single-writer rule holds.
+        if (swimlane_record != nullptr) {
+            cfg.swimlane_head->live_record_count += 1;
+        } else {
+            cfg.swimlane_head->dropped_record_count += 1;
+        }
+        cfg.swimlane_head->total_record_count += 1;
+        dcci(cfg.swimlane_head, SINGLE_CACHE_LINE, CACHELINE_OUT);
+        dsb((mem_dsb_t)0);
+    }
     return percounter_async_seal(cfg, state, task, slot, may_defer, deferred);
 }
 
@@ -724,6 +778,7 @@ inline __aicore__ bool percounter_run_task(
     uint64_t timeout_cycles, bool may_defer, uint64_t *kernel_start, bool *deferred
 ) {
     *deferred = false;
+    state->dispatch_entry = get_sys_cnt_aicore();
     scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(cfg.payload));
     __gm__ int32_t *kernel_ids = percounter_kernel_ids(task);
     for (int32_t slot = 0; slot < PLATFORM_CORES_PER_BLOCKDIM; ++slot) {
@@ -744,6 +799,7 @@ inline __aicore__ bool percounter_run_subtask(
     bool *deferred
 ) {
     *deferred = false;
+    state->dispatch_entry = get_sys_cnt_aicore();
     scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(cfg.payload));
     const int32_t kernel_id = percounter_kernel_ids(task)[subtask_slot];
     if (kernel_id < 0) return true;
@@ -1878,7 +1934,16 @@ inline __aicore__ bool percounter_wait_for_entry(
  */
 inline __aicore__ void percounter_lane_loop(const LaneConfig &cfg, uint64_t timeout_cycles) {
     PercounterLaneState state{
-        0, 0, PercounterMixClaim{-1, 0, 1, false, -1}, PercounterSyncState{0, 0, -1, -1, 0, 0, 0}, {}, 0, 0
+        0,
+        0,
+        PercounterMixClaim{-1, 0, 1, false, -1},
+        PercounterSyncState{0, 0, -1, -1, 0, 0, 0},
+        {},
+        0,
+        0,
+        ChipSwimlaneAicoreLocalState{nullptr, UINT32_MAX, 0},
+        0,
+        0
     };
     uint64_t range_first = 0;
     uint32_t pending = 0;
@@ -2072,6 +2137,11 @@ inline __aicore__ void run_percounter_lane(__gm__ PercounterControl *control, in
     cfg.async_group_base_index = static_cast<uint32_t>(block_idx) * PERCOUNTER_ASYNC_SLOTS;
     cfg.cluster_index = coordinate.cluster_index;
     cfg.cluster_lane = coordinate.cluster_lane;
+    // The AICPU published this core's rotation-table slot in its pre-handshake
+    // init, which precedes the READY this lane has already observed.
+    cfg.swimlane_head = SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_CHIP_SWIMLANE) ?
+                            get_chip_swimlane_aicore_head() :
+                            nullptr;
 
     const uint64_t timeout_cycles = scheduler_gm_query(control->scheduler_timeout_cycles);
     cfg.sync_cohort_count = scheduler_gm_query(control->sync_cohort_count);
